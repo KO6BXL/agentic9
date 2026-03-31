@@ -14,13 +14,25 @@ type Client struct {
 	mu    sync.Mutex
 	msize uint32
 	tag   uint16
+	fid   uint32
 }
 
 func NewClient(rw io.ReadWriteCloser) *Client {
-	return &Client{rw: rw, br: bufio.NewReader(rw), msize: 8192, tag: 1}
+	return &Client{rw: rw, br: bufio.NewReader(rw), msize: 8192, tag: 1, fid: 2}
 }
 
 func (c *Client) Close() error { return c.rw.Close() }
+
+func (c *Client) AllocFID() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fid := c.fid
+	c.fid++
+	if c.fid == NOFID {
+		c.fid = 2
+	}
+	return fid
+}
 
 func (c *Client) Version(ctx context.Context, version string) error {
 	_, err := c.rpc(ctx, Fcall{Type: TVERSION, Tag: NOTAG, Msize: c.msize, Version: version})
@@ -128,6 +140,8 @@ func (c *Client) rpc(ctx context.Context, req Fcall) (Fcall, error) {
 }
 
 func (c *Client) nextTag() uint16 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	tag := c.tag
 	c.tag++
 	if c.tag == NOTAG {

@@ -112,7 +112,7 @@ Status:
 
 - [internal/remoteexec/runner.go](/home/me1on/proj/agentic9/internal/remoteexec/runner.go) builds a remote rc script and parses a sentinel line.
 - The parser tests pass.
-- The current script uses simple string joining for the command line.
+- Command arguments are now rc-quoted individually, with unit coverage for spaces, embedded quotes, empty args, and metacharacters.
 
 Why this matters:
 
@@ -121,8 +121,8 @@ Why this matters:
 
 What to implement:
 
-- Replace naive `strings.Join(command, " ")` with rc-safe argument quoting for every argument.
-- Confirm the exit sentinel cannot collide with typical command output.
+- [x] Replace naive `strings.Join(command, " ")` with rc-safe argument quoting for every argument.
+- [x] Confirm the exit sentinel cannot collide with typical command output.
 - Confirm remote errors before the sentinel are surfaced as `client_error`.
 - Add timeout and cancellation tests once transport exists.
 
@@ -156,7 +156,7 @@ Status:
   - `Chmod`
   - `Truncate`
 - It does not support:
-  - directory listing
+  - [x] directory listing
   - symlink creation
   - symlink reads
 - Several behaviors are too naive for real use.
@@ -168,11 +168,11 @@ Why this matters:
 
 What to implement:
 
-- Implement `List` by opening a directory and decoding directory entries from 9P `read` responses.
+- [x] Implement `List` by opening a directory and decoding directory entries from 9P `read` responses.
 - Implement `Symlink` and `Readlink` if exportfs/remote fs supports them.
 - Confirm the right mode bits for directories, regular files, and symlinks.
 - Make `Rename` correct for cross-directory moves if 9front `wstat` semantics allow it.
-- Make `walkTo` fid allocation deterministic and collision-safe.
+- [x] Make `walkTo` fid allocation deterministic and collision-safe.
 
 Specific methods to finish:
 
@@ -206,12 +206,12 @@ Why this matters:
 
 What to implement:
 
-- Add a proper fid allocator.
+- [x] Add a proper fid allocator.
 - Add a proper tag allocator.
 - Decide whether to keep the client fully serialized or support concurrent in-flight RPCs with demultiplexing by tag.
 - Validate and negotiate `msize` based on the server response.
 - Improve error reporting on malformed or truncated responses.
-- Add helpers for directory read decoding.
+- [x] Add helpers for directory read decoding.
 
 Implementation context:
 

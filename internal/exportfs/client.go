@@ -56,7 +56,35 @@ func (c *Client) Stat(ctx context.Context, p string) (Entry, error) {
 }
 
 func (c *Client) List(ctx context.Context, p string) ([]Entry, error) {
-	return nil, errors.New("remote directory listing is not implemented yet")
+	cli, fid, _, err := c.walkTo(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	defer cli.Clunk(context.Background(), fid)
+	if _, _, err := cli.Open(ctx, fid, 0); err != nil {
+		return nil, err
+	}
+	var (
+		entries []Entry
+		offset  uint64
+	)
+	for {
+		data, err := cli.Read(ctx, fid, offset, 8192)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			return entries, nil
+		}
+		dirs, err := ninep.ParseDirEntries(data)
+		if err != nil {
+			return nil, err
+		}
+		for i := range dirs {
+			entries = append(entries, entryFromDir(path.Join(cleanPath(p), dirs[i].Name), &dirs[i]))
+		}
+		offset += uint64(len(data))
+	}
 }
 
 func (c *Client) Open(ctx context.Context, p string, flags uint32) (FileHandle, Entry, error) {
@@ -183,7 +211,7 @@ func (c *Client) walkTo(ctx context.Context, p string) (*ninep.Client, uint32, *
 		return nil, 0, nil, err
 	}
 	clean := cleanPath(p)
-	fid := uint32(time.Now().UnixNano())
+	fid := cli.AllocFID()
 	if clean == "/" {
 		if _, err := cli.Walk(ctx, 1, fid, nil); err != nil {
 			return nil, 0, nil, err

@@ -55,12 +55,20 @@ func (r *Runner) Run(ctx context.Context, command []string, output func([]byte) 
 func BuildScript(workspace string, command []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "cd %s || exit 'cd'\n", rcQuote(workspace))
-	b.WriteString(strings.Join(command, " "))
+	b.WriteString(rcQuoteCommand(command))
 	b.WriteByte('\n')
 	b.WriteString("status=$status\n")
 	fmt.Fprintf(&b, "echo '%s'$status\n", sentinelPrefix)
 	b.WriteString("exit $status\n")
 	return b.String()
+}
+
+func rcQuoteCommand(command []string) string {
+	quoted := make([]string, 0, len(command))
+	for _, arg := range command {
+		quoted = append(quoted, rcQuote(arg))
+	}
+	return strings.Join(quoted, " ")
 }
 
 func rcQuote(s string) string {

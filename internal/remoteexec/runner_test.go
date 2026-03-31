@@ -33,6 +33,14 @@ func TestParserHandlesSplitSentinel(t *testing.T) {
 	}
 }
 
+func TestParserIgnoresLookalikeSentinelText(t *testing.T) {
+	p := &Parser{}
+	a, done, status := p.Feed([]byte("hello\nagentic9-exit fail\n"))
+	if string(a) != "hello\nagentic9-exit fail\n" || done || status != "" {
+		t.Fatalf("unexpected feed: %q done=%v status=%q", a, done, status)
+	}
+}
+
 func TestRunnerBuildsAndParses(t *testing.T) {
 	exec := &fakeExec{chunks: [][]byte{
 		[]byte("ok\n"),
@@ -55,5 +63,25 @@ func TestRunnerBuildsAndParses(t *testing.T) {
 	}
 	if got := BuildScript("/tmp/work", []string{"echo", "ok"}); got != exec.script {
 		t.Fatalf("unexpected script:\n%s\nwant:\n%s", exec.script, got)
+	}
+}
+
+func TestBuildScriptQuotesEachArgumentForRC(t *testing.T) {
+	got := BuildScript("/tmp/with 'quote'", []string{
+		"echo",
+		"two words",
+		"O'Brien",
+		"$path",
+		"",
+		";|&<>",
+		"paren(arg)",
+	})
+	want := "cd '/tmp/with ''quote''' || exit 'cd'\n" +
+		"'echo' 'two words' 'O''Brien' '$path' '' ';|&<>' 'paren(arg)'\n" +
+		"status=$status\n" +
+		"echo '\x01agentic9-exit '$status\n" +
+		"exit $status\n"
+	if got != want {
+		t.Fatalf("unexpected script:\n%s\nwant:\n%s", got, want)
 	}
 }
