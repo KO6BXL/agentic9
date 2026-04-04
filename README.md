@@ -19,6 +19,8 @@ go build ./cmd/agentic9
 go test ./...
 ```
 
+If you are not inside the `agentic9` source tree, use the installed `agentic9` binary instead of `go run ./cmd/agentic9`.
+
 ## Configuration
 
 Create `~/.config/agentic9/config.toml`:
@@ -49,12 +51,15 @@ Rules:
 ```bash
 go run ./cmd/agentic9 profile verify --profile default --json
 go run ./cmd/agentic9 workspace create --profile default --agent-id agent-123 --source /path/to/src --json
-go run ./cmd/agentic9 exec --profile default --agent-id agent-123 --json -- mk test
+go run ./cmd/agentic9 exec --profile default --agent-id agent-123 --json -- rc -lc 'mk test'
 go run ./cmd/agentic9 workspace delete --profile default --agent-id agent-123 --json
 ```
+
+`workspace create --json` returns the mounted workspace path in both `mountpoint` and `edit_path`. The source tree is copied into that mount once; after creation, edit files under `edit_path` if you want later changes to be visible on the remote host.
+
+`exec --json` emits NDJSON with `start`, `output`, and `exit` events. Known benign non-interactive `/mnt/term/dev` bind warnings are suppressed from `output` events and reported as structured `warnings` on the final `exit` event instead.
 
 ## More detail
 
 - CLI usage details and automation guidance: [SKILL.md](/home/me1on/proj/agentic9/SKILL.md)
 - current implementation backlog: [TODO.md](/home/me1on/proj/agentic9/TODO.md)
-

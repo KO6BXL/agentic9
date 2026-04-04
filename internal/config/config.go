@@ -81,14 +81,24 @@ func (c *Config) LoadSecret(name string) (Secret, error) {
 	case profile.SecretEnv != "":
 		value := os.Getenv(profile.SecretEnv)
 		if value == "" {
-			return Secret{}, fmt.Errorf("secret env %q is empty", profile.SecretEnv)
+			return Secret{}, fmt.Errorf(
+				"secret env %q is empty for profile %q; export %s or update the profile to use secret_command",
+				profile.SecretEnv,
+				name,
+				profile.SecretEnv,
+			)
 		}
 		return Secret{Value: value, Source: "env:" + profile.SecretEnv}, nil
 	case len(profile.SecretCommand) > 0:
 		cmd := exec.Command(profile.SecretCommand[0], profile.SecretCommand[1:]...)
 		out, err := cmd.Output()
 		if err != nil {
-			return Secret{}, fmt.Errorf("secret command failed: %w", err)
+			return Secret{}, fmt.Errorf(
+				"secret command failed for profile %q (%s): %w",
+				name,
+				strings.Join(profile.SecretCommand, " "),
+				err,
+			)
 		}
 		return Secret{Value: strings.TrimSpace(string(out)), Source: "command"}, nil
 	default:

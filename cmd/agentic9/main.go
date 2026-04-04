@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -113,6 +114,10 @@ func workspaceCreate(ctx context.Context, args []string) error {
 	if err := workspace.ValidateAgentID(*agentID); err != nil {
 		return err
 	}
+	sourcePath, err := filepath.Abs(*source)
+	if err != nil {
+		return err
+	}
 	cfg, profile, secret, err := loadProfile(*profileName)
 	if err != nil {
 		return err
@@ -143,7 +148,7 @@ func workspaceCreate(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := copyTreeWithRetry(ctx, *source, mp, syncdir.Options{Mirror: *mirror}); err != nil {
+	if err := copyTreeWithRetry(ctx, sourcePath, mp, syncdir.Options{Mirror: *mirror}); err != nil {
 		_ = stopDetachedMount(cfg.RuntimeRoot(), mp)
 		return err
 	}
@@ -152,14 +157,7 @@ func workspaceCreate(ctx context.Context, args []string) error {
 		return err
 	}
 	if *jsonOut {
-		return writeJSON(map[string]any{
-			"ok":          true,
-			"agent_id":    *agentID,
-			"remote_root": remoteRoot,
-			"mountpoint":  mp,
-			"mounted":     true,
-			"pid":         state.PID,
-		})
+		return writeJSON(workspaceCreateJSON(*agentID, remoteRoot, mp, sourcePath, state.PID, *mirror))
 	}
 	fmt.Println(mp)
 	return nil
@@ -320,6 +318,7 @@ func workspacePath(ctx context.Context, args []string) error {
 				"ok":          false,
 				"agent_id":    meta.AgentID,
 				"remote_root": meta.RemoteRoot,
+				"edit_path":   "",
 				"mountpoint":  "",
 				"mounted":     false,
 				"error":       err.Error(),
@@ -331,6 +330,7 @@ func workspacePath(ctx context.Context, args []string) error {
 		return writeJSON(map[string]any{
 			"ok":          true,
 			"agent_id":    meta.AgentID,
+			"edit_path":   meta.Mountpoint,
 			"mountpoint":  meta.Mountpoint,
 			"remote_root": meta.RemoteRoot,
 			"mounted":     true,
@@ -453,6 +453,7 @@ func execRemote(ctx context.Context, args []string) error {
 	client := tlsrcpu.NewClient(profile, secret)
 	runner := remoteexec.NewRunner(client, workspace.RemoteRoot(profile, *agentID))
 	start := time.Now()
+	outputRouter := newExecOutputRouter(*jsonOut)
 	if *jsonOut {
 		_ = writeJSON(map[string]any{
 			"type":      "start",
@@ -460,18 +461,9 @@ func execRemote(ctx context.Context, args []string) error {
 			"command":   cmdArgs,
 		})
 	}
-	result, err := runner.Run(ctx, cmdArgs, func(data []byte) error {
-		if !*jsonOut {
-			_, werr := os.Stdout.Write(data)
-			return werr
-		}
-		return writeJSON(map[string]any{
-			"type":   "output",
-			"stream": "remote",
-			"data":   string(data),
-		})
-	})
+	result, err := runner.Run(ctx, cmdArgs, outputRouter.Write)
 	if err != nil {
+		_ = outputRouter.Flush()
 		if *jsonOut {
 			_ = writeJSON(map[string]any{
 				"type":  "client_error",
@@ -480,19 +472,139 @@ func execRemote(ctx context.Context, args []string) error {
 		}
 		return err
 	}
+	if err := outputRouter.Flush(); err != nil {
+		return err
+	}
 	if *jsonOut {
-		_ = writeJSON(map[string]any{
+		exitEvent := map[string]any{
 			"type":          "exit",
 			"ok":            result.ExitCode == 0,
 			"exit_code":     result.ExitCode,
 			"remote_status": result.RemoteStatus,
 			"duration_ms":   time.Since(start).Milliseconds(),
-		})
+		}
+		if len(outputRouter.warnings) > 0 {
+			exitEvent["warnings"] = outputRouter.warnings
+		}
+		_ = writeJSON(exitEvent)
 	}
 	if result.ExitCode != 0 {
 		return exitCodeError(result.ExitCode)
 	}
 	return nil
+}
+
+type execWarning struct {
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+	Benign  bool   `json:"benign"`
+}
+
+type execOutputRouter struct {
+	jsonOut  bool
+	pending  bytes.Buffer
+	warnings []execWarning
+}
+
+func newExecOutputRouter(jsonOut bool) *execOutputRouter {
+	return &execOutputRouter{jsonOut: jsonOut}
+}
+
+func (r *execOutputRouter) Write(chunk []byte) error {
+	if len(chunk) == 0 {
+		return nil
+	}
+	if _, err := r.pending.Write(chunk); err != nil {
+		return err
+	}
+	return r.flushLines(false)
+}
+
+func (r *execOutputRouter) Flush() error {
+	return r.flushLines(true)
+}
+
+func (r *execOutputRouter) flushLines(flushRemainder bool) error {
+	data := r.pending.Bytes()
+	consumed := 0
+	for {
+		idx := bytes.IndexByte(data[consumed:], '\n')
+		if idx < 0 {
+			break
+		}
+		end := consumed + idx + 1
+		if err := r.handleLine(data[consumed:end]); err != nil {
+			return err
+		}
+		consumed = end
+	}
+	if flushRemainder && consumed < len(data) {
+		if err := r.handleLine(data[consumed:]); err != nil {
+			return err
+		}
+		consumed = len(data)
+	}
+	if consumed == 0 {
+		return nil
+	}
+	remaining := append([]byte(nil), data[consumed:]...)
+	r.pending.Reset()
+	_, _ = r.pending.Write(remaining)
+	return nil
+}
+
+func (r *execOutputRouter) handleLine(line []byte) error {
+	if warning, ok := classifyExecWarning(line); ok {
+		r.warnings = append(r.warnings, warning)
+		return nil
+	}
+	if !r.jsonOut {
+		_, err := os.Stdout.Write(line)
+		return err
+	}
+	return writeJSON(map[string]any{
+		"type":   "output",
+		"stream": "remote",
+		"data":   string(line),
+	})
+}
+
+func classifyExecWarning(line []byte) (execWarning, bool) {
+	message := strings.TrimRight(string(line), "\r\n")
+	switch message {
+	case "bind: /mnt/term/dev/cons: file does not exist: '/mnt/term/dev'":
+		return execWarning{
+			Kind:    "benign_remote_bind_warning",
+			Message: message,
+			Benign:  true,
+		}, true
+	case "bind: /mnt/term/dev: file does not exist: '/mnt/term/dev'":
+		return execWarning{
+			Kind:    "benign_remote_bind_warning",
+			Message: message,
+			Benign:  true,
+		}, true
+	default:
+		return execWarning{}, false
+	}
+}
+
+func workspaceCreateJSON(agentID, remoteRoot, mountpoint, sourcePath string, pid int, mirror bool) map[string]any {
+	syncMode := "copy-once"
+	if mirror {
+		syncMode = "mirror-once"
+	}
+	return map[string]any{
+		"ok":          true,
+		"agent_id":    agentID,
+		"remote_root": remoteRoot,
+		"mountpoint":  mountpoint,
+		"edit_path":   mountpoint,
+		"source_path": sourcePath,
+		"sync_mode":   syncMode,
+		"mounted":     true,
+		"pid":         pid,
+	}
 }
 
 func serveMount(ctx context.Context, args []string) error {

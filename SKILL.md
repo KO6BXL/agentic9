@@ -14,7 +14,9 @@ description: Use this skill when you need to operate the agentic9 CLI in this re
 
 ## First steps
 
-1. Prefer `go run ./cmd/agentic9 ...` while iterating inside the repo. Use `go build ./cmd/agentic9` only if you specifically want a standalone binary.
+1. Choose the launcher based on where you are working:
+   - If the current repository is the `agentic9` source tree, prefer `go run ./cmd/agentic9 ...` while iterating.
+   - Otherwise, use the installed `agentic9 ...` binary and do not assume `./cmd/agentic9` exists.
 2. Make sure `~/.config/agentic9/config.toml` exists and defines the target profile.
 3. Each profile must set `cpu_host`, `auth_host`, `user`, `auth_domain`, and exactly one of `secret_env` or `secret_command`.
 4. If `remote_base` is omitted, the CLI defaults it to `/usr/$user/agentic9/workspaces`.
@@ -32,12 +34,21 @@ remote_base = "/usr/glenda/agentic9/workspaces"
 secret_env = "AGENTIC9_SECRET"
 ```
 
+If you are not in the `agentic9` source tree, replace `go run ./cmd/agentic9` in the examples below with `agentic9`.
+
+## If verify fails
+
+- If verification fails with `secret env "<NAME>" is empty`, the configured environment variable is missing or empty.
+- If the profile uses `secret_command`, prefer using that as configured rather than inventing a different recovery path.
+- If the profile uses `secret_env` and the variable is missing, stop and ask the user to provide or export the secret. Do not guess, hardcode, or silently continue with an empty value.
+- Treat secret-loading failures as configuration blockers. Fix them before attempting `workspace create`, `mount`, or `exec`.
+
 ## Command model
 
 - `profile verify --profile <name> [--json]`
   Performs the real `dp9ik` plus TLS-PSK `rcpu` handshake. Prefer `--json` for automation.
 - `workspace create --profile <name> --agent-id <id> --source <local-path> [--mountpoint <path>] [--mirror] [--json]`
-  Ensures the remote workspace exists, starts a detached mount helper, copies the local source tree into the mount, and saves local workspace metadata.
+  Ensures the remote workspace exists, starts a detached mount helper, copies the local source tree into the mount once, and saves local workspace metadata.
 - `workspace path --profile <name> --agent-id <id> [--json]`
   Returns the mounted local path if the workspace is currently mounted. With `--json`, an unmounted workspace returns `ok: false`, `mounted: false`, and `error: "workspace is not mounted"`.
 - `mount --profile <name> --agent-id <id> --mountpoint <path> [--json]`
@@ -64,8 +75,8 @@ Do not call `__serve-mount` directly. It is an internal helper used by detached 
 Prefer `--json` for all commands that support it.
 
 - `profile verify --json` emits one JSON object with `ok`, `profile`, `cpu_host`, `auth_host`, `user`, `error`, and `configPath`.
-- `workspace create --json` emits one JSON object including `ok`, `agent_id`, `remote_root`, `mountpoint`, `mounted`, and `pid`.
-- `workspace path --json` emits one JSON object describing mounted state and mountpoint.
+- `workspace create --json` emits one JSON object including `ok`, `agent_id`, `remote_root`, `mountpoint`, `edit_path`, `source_path`, `sync_mode`, `mounted`, and `pid`.
+- `workspace path --json` emits one JSON object describing mounted state and mountpoint, including `edit_path` when mounted.
 - `mount --json` emits one JSON object including `ok`, `agent_id`, `profile`, `mountpoint`, `pid`, and `mounted`.
 - `unmount --json` emits one JSON object with `ok`, `mountpoint`, and `error`.
 - `workspace delete --json` emits one JSON object with per-step status fields: `metadata_lookup`, `unmount`, `remote_delete`, `metadata`, plus top-level `ok`, `agent_id`, `remote_root`, and `error`.
@@ -75,6 +86,7 @@ Prefer `--json` for all commands that support it.
 - a `start` event with `workspace` and `command`
 - zero or more `output` events with `stream: "remote"` and `data`
 - an `exit` event with `ok`, `exit_code`, `remote_status`, and `duration_ms`
+- the `exit` event may also include a `warnings` array for benign remote warnings that were suppressed from normal output
 - if the client fails before normal completion, a `client_error` event
 
 Remote stdout and stderr are intentionally combined into the single `"remote"` stream.
@@ -89,6 +101,22 @@ Remote stdout and stderr are intentionally combined into the single `"remote"` s
 6. Delete the workspace when finished: `go run ./cmd/agentic9 workspace delete --profile default --agent-id <id> --json`
 
 If a workspace exists remotely but is not mounted locally, use `mount --json` to reattach it before editing files.
+
+Important: `workspace create --source <local-path>` is a one-time copy into the mounted remote workspace. After creation, edit files under the returned `mountpoint` if you want later changes to be visible on the remote host. Editing the original source directory does not automatically update the remote workspace unless you copy or sync those changes yourself.
+
+## Remote exec notes
+
+- Prefer explicit shell invocations for multi-step commands, for example `rc -lc '<command>'`, so quoting and working-directory expectations are clear.
+- Non-interactive `exec` runs may print warnings like `bind: /mnt/term/dev/cons: file does not exist: '/mnt/term/dev'` or `bind: /mnt/term/dev: file does not exist: '/mnt/term/dev'`. If the command still reaches a normal `exit` event, treat those warnings as non-fatal noise rather than a separate blocker.
+
+Minimal cookbook:
+
+- Inspect the remote workspace:
+  `go run ./cmd/agentic9 exec --profile default --agent-id <id> --json -- rc -lc 'pwd; ls -l'`
+- Build and run a simple program:
+  `go run ./cmd/agentic9 exec --profile default --agent-id <id> --json -- rc -lc 'mk && ./hello'`
+- Check tool availability before building:
+  `go run ./cmd/agentic9 exec --profile default --agent-id <id> --json -- rc -lc 'which mk; which 8c; which 6c'`
 
 ## Validation
 
