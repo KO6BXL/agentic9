@@ -143,7 +143,7 @@ func workspaceCreate(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := syncdir.CopyTree(*source, mp, syncdir.Options{Mirror: *mirror}); err != nil {
+	if err := copyTreeWithRetry(ctx, *source, mp, syncdir.Options{Mirror: *mirror}); err != nil {
 		_ = stopDetachedMount(cfg.RuntimeRoot(), mp)
 		return err
 	}
@@ -188,28 +188,96 @@ func workspaceDelete(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	meta, err := manager.Load(*profileName, *agentID)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	report := workspaceDeleteReport{
+		OK:             true,
+		AgentID:        *agentID,
+		RemoteRoot:     workspace.RemoteRoot(profile, *agentID),
+		MetadataLookup: skippedStep("not attempted"),
+		Unmount:        skippedStep("not attempted"),
+		RemoteDelete:   skippedStep("not attempted"),
+		Metadata:       skippedStep("not attempted"),
 	}
-	if err == nil {
-		meta, err = refreshWorkspaceMetadata(cfg.RuntimeRoot(), manager, meta)
-		if err != nil {
+	meta, loadErr := manager.Load(*profileName, *agentID)
+	metaFound := false
+	switch {
+	case loadErr == nil:
+		report.MetadataLookup = okStep()
+		meta, loadErr = refreshWorkspaceMetadata(cfg.RuntimeRoot(), manager, meta)
+		if loadErr != nil {
+			report.MetadataLookup = errorStep(loadErr)
+			report.OK = false
+		} else {
+			metaFound = true
+			if meta.RemoteRoot != "" {
+				report.RemoteRoot = meta.RemoteRoot
+			}
+		}
+	case errors.Is(loadErr, os.ErrNotExist):
+		report.MetadataLookup = skippedStep("workspace metadata not found")
+	default:
+		report.MetadataLookup = errorStep(loadErr)
+		report.OK = false
+	}
+
+	unmountOK := false
+	if metaFound {
+		if meta.Mounted && meta.Mountpoint != "" {
+			if err := stopDetachedMount(cfg.RuntimeRoot(), meta.Mountpoint); err != nil {
+				report.Unmount = errorStep(err)
+				report.OK = false
+			} else {
+				report.Unmount = okStep()
+				unmountOK = true
+			}
+		} else {
+			report.Unmount = skippedStep("workspace was not mounted")
+			unmountOK = true
+		}
+	} else {
+		report.Unmount = skippedStep("workspace metadata unavailable")
+	}
+
+	client := tlsrcpu.NewClient(profile, secret)
+	if err := client.RemoveRemoteTree(ctx, report.RemoteRoot); err != nil {
+		report.RemoteDelete = errorStep(err)
+		report.OK = false
+	} else {
+		report.RemoteDelete = okStep()
+	}
+
+	switch {
+	case !metaFound:
+		report.Metadata = skippedStep("workspace metadata not found")
+	case report.RemoteDelete.Status == stepOK && unmountOK:
+		if err := manager.Delete(*profileName, *agentID); err != nil && !errors.Is(err, os.ErrNotExist) {
+			report.Metadata = errorStep(err)
+			report.OK = false
+		} else {
+			report.Metadata = stepResult{Status: "deleted"}
+		}
+	case report.Unmount.Status == stepOK:
+		if err := clearWorkspaceMountState(manager, *profileName, *agentID); err != nil {
+			report.Metadata = errorStep(err)
+			report.OK = false
+		} else {
+			report.Metadata = stepResult{Status: "updated"}
+		}
+	default:
+		report.Metadata = skippedStep("leaving metadata in place after earlier failure")
+	}
+
+	report.finish()
+	if *jsonOut {
+		if err := writeJSON(report); err != nil {
 			return err
 		}
-		if meta.Mounted && meta.Mountpoint != "" {
-			_ = stopDetachedMount(cfg.RuntimeRoot(), meta.Mountpoint)
+		if !report.OK {
+			return errors.New(report.Error)
 		}
+		return nil
 	}
-	client := tlsrcpu.NewClient(profile, secret)
-	if err := client.RemoveRemoteTree(ctx, workspace.RemoteRoot(profile, *agentID)); err != nil {
-		return err
-	}
-	if err == nil {
-		_ = manager.Delete(*profileName, *agentID)
-	}
-	if *jsonOut {
-		return writeJSON(map[string]any{"ok": true, "agent_id": *agentID})
+	if !report.OK {
+		return errors.New(report.Error)
 	}
 	return nil
 }
@@ -650,6 +718,90 @@ func readLogTail(path string) string {
 		data = data[len(data)-max:]
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func copyTreeWithRetry(ctx context.Context, src, dst string, opts syncdir.Options) error {
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		err = syncdir.CopyTree(src, dst, opts)
+		if err == nil {
+			return nil
+		}
+		if !isRetriableMountSyncError(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return err
+}
+
+func isRetriableMountSyncError(err error) bool {
+	return errors.Is(err, syscall.EIO) ||
+		errors.Is(err, syscall.ENOTCONN) ||
+		errors.Is(err, syscall.EINTR)
+}
+
+const stepOK = "ok"
+
+type stepResult struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+type workspaceDeleteReport struct {
+	OK             bool       `json:"ok"`
+	AgentID        string     `json:"agent_id"`
+	RemoteRoot     string     `json:"remote_root"`
+	MetadataLookup stepResult `json:"metadata_lookup"`
+	Unmount        stepResult `json:"unmount"`
+	RemoteDelete   stepResult `json:"remote_delete"`
+	Metadata       stepResult `json:"metadata"`
+	Error          string     `json:"error,omitempty"`
+}
+
+func okStep() stepResult {
+	return stepResult{Status: stepOK}
+}
+
+func skippedStep(reason string) stepResult {
+	return stepResult{Status: "skipped", Error: reason}
+}
+
+func errorStep(err error) stepResult {
+	if err == nil {
+		return okStep()
+	}
+	return stepResult{Status: "error", Error: err.Error()}
+}
+
+func (r *workspaceDeleteReport) finish() {
+	if r.OK {
+		r.Error = ""
+		return
+	}
+	failures := make([]string, 0, 4)
+	for _, step := range []struct {
+		name string
+		res  stepResult
+	}{
+		{name: "metadata lookup", res: r.MetadataLookup},
+		{name: "unmount", res: r.Unmount},
+		{name: "remote delete", res: r.RemoteDelete},
+		{name: "metadata", res: r.Metadata},
+	} {
+		if step.res.Status == "error" {
+			failures = append(failures, fmt.Sprintf("%s: %s", step.name, step.res.Error))
+		}
+	}
+	if len(failures) == 0 {
+		r.Error = "workspace delete failed"
+		return
+	}
+	r.Error = strings.Join(failures, "; ")
 }
 
 func loadProfile(name string) (*config.Config, config.Profile, config.Secret, error) {

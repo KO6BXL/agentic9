@@ -79,5 +79,30 @@ func ValidateAgentID(agentID string) error {
 	if agentID == "" {
 		return fmt.Errorf("agent id must not be empty")
 	}
+	if len(agentID) > 64 {
+		return fmt.Errorf("agent id must be at most 64 characters")
+	}
+	if agentID == "." || agentID == ".." {
+		return fmt.Errorf("agent id %q is not allowed", agentID)
+	}
+	first := agentID[0]
+	if !isAgentIDAlphaNum(first) {
+		return fmt.Errorf("agent id must start with an ASCII letter or digit")
+	}
+	for i := 0; i < len(agentID); i++ {
+		ch := agentID[i]
+		if isAgentIDAlphaNum(ch) {
+			continue
+		}
+		switch ch {
+		case '-', '_', '.':
+		default:
+			return fmt.Errorf("agent id may only contain ASCII letters, digits, '.', '_' or '-'")
+		}
+	}
 	return nil
+}
+
+func isAgentIDAlphaNum(ch byte) bool {
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9'
 }

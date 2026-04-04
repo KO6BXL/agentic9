@@ -70,6 +70,7 @@ Rules:
 - exactly one of `secret_env` or `secret_command` must be set
 - `remote_base` defaults to `/usr/$user/agentic9/workspaces`
 - plaintext secrets in the config file are not supported
+- `agent-id` must start with an ASCII letter or digit, may contain only ASCII letters, digits, `.`, `_`, and `-`, and must be at most 64 characters
 
 ## Commands
 
@@ -172,6 +173,8 @@ Notes:
 ./agentic9 workspace delete --profile default --agent-id agent-123 --json
 ```
 
+`workspace delete --json` now reports per-step status for metadata lookup, local unmount, remote delete, and final metadata cleanup so partial failures are visible to callers.
+
 ## Intended workflow
 
 1. Configure a `default` profile.
@@ -183,7 +186,9 @@ Notes:
 
 ## Integration test
 
-The integration test is opt-in and runs only when these env vars are set:
+The real-host integration tests are opt-in.
+
+You can run them either by setting explicit `AGENTIC9_IT_*` variables:
 
 ```bash
 export AGENTIC9_IT_CPU_HOST='cpu.example.net'
@@ -194,7 +199,16 @@ export AGENTIC9_IT_SECRET='your-9front-secret'
 go test ./integration -v
 ```
 
-It performs a real `profile verify`-equivalent handshake and a simple remote `exec` against the target host.
+Or by using a configured profile from `~/.config/agentic9/config.toml`:
+
+```bash
+export AGENTIC9_SECRET='your-9front-secret'
+export AGENTIC9_IT_PROFILE='local'
+go test ./integration -v
+```
+
+If `AGENTIC9_IT_PROFILE` is unset, the integration package defaults to profile `local`.
+The workspace lifecycle test is additionally gated behind `AGENTIC9_IT_WORKSPACE=1` because it depends on local FUSE availability.
 
 ## Repository layout
 

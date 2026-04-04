@@ -199,36 +199,11 @@ Acceptance criteria:
 
 ## Priority 2: CLI and workflow hardening
 
-### 2.1 Make `workspace delete` report partial failures accurately
-
-Problem:
-
-- [`workspaceDelete`](/home/me1on/proj/agentic9/cmd/agentic9/main.go#L167) attempts local unmount, remote delete, and metadata cleanup, but it does not clearly report partial failure states
-
-Why it matters:
-
-- workspace cleanup is operationally sensitive
-- users need to know which part failed
-
-What to do:
-
-- separate:
-  - local metadata lookup failures
-  - local unmount failures
-  - remote delete failures
-  - metadata deletion failures
-- decide whether JSON output should include per-step status
-
-Acceptance criteria:
-
-- failure output makes it clear what was cleaned up and what remains
-
 ### 2.2 Centralize `agent-id` validation and workspace invariants
 
 Problem:
 
-- CLI code mostly checks only for non-empty `agent-id`
-- [ValidateAgentID](/home/me1on/proj/agentic9/internal/workspace/state.go) exists but is not used as the central gate
+- the CLI now uses [ValidateAgentID](/home/me1on/proj/agentic9/internal/workspace/state.go) consistently, but the accepted format is still only locally enforced and not validated against real workflow needs
 
 Why it matters:
 
@@ -254,7 +229,7 @@ Acceptance criteria:
 
 Problem:
 
-- CLI JSON output exists, but behavior around failures and partial failures is not fully nailed down
+- CLI JSON output exists, but the shapes are not fully test-locked yet
 
 Why it matters:
 
@@ -382,7 +357,5 @@ Before handing tasks off, these are the most useful manual checks to run against
 
 ## Short bug list
 
-- [`Symlink`](/home/me1on/proj/agentic9/internal/exportfs/client.go#L174) is unimplemented.
-- [`Readlink`](/home/me1on/proj/agentic9/internal/exportfs/client.go#L181) is unimplemented.
-- [`workspaceDelete`](/home/me1on/proj/agentic9/cmd/agentic9/main.go#L167) still does not report partial cleanup failures precisely.
+- real symlink support is still unimplemented; the current client now returns stable `ENOSYS` behavior through FUSE instead of generic errors.
 - real-host integration only covers verify + simple exec in [integration_test.go](/home/me1on/proj/agentic9/integration/integration_test.go#L15).

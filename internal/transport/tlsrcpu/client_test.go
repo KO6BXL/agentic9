@@ -391,11 +391,13 @@ func pskConfig(secret []byte) *tlspsk.Config {
 		InsecureSkipVerify: true,
 		MinVersion:         tlspsk.VersionTLS12,
 		MaxVersion:         tlspsk.VersionTLS12,
-		CurvePreferences:   []tlspsk.CurveID{tlspsk.CurveP256},
 		GetCertificate: func(*tlspsk.ClientHelloInfo) (*tlspsk.Certificate, error) {
 			return &tlspsk.Certificate{}, nil
 		},
 		CipherSuites: []uint16{
+			tlspsk.TLS_PSK_WITH_CHACHA20_POLY1305,
+			tlspsk.TLS_PSK_WITH_AES_128_CBC_SHA256,
+			tlspsk.TLS_PSK_WITH_AES_128_CBC_SHA,
 			tlspsk.TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
 			tlspsk.TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
 			tlspsk.TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA384,

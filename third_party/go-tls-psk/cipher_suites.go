@@ -66,6 +66,9 @@ func CipherSuites() []*CipherSuite {
 		{TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", supportedOnlyTLS12, false},
 		{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", supportedOnlyTLS12, false},
 		{TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", supportedOnlyTLS12, false},
+		{TLS_PSK_WITH_AES_128_CBC_SHA, "TLS_PSK_WITH_AES_128_CBC_SHA", supportedUpToTLS12, false},
+		{TLS_PSK_WITH_AES_128_CBC_SHA256, "TLS_PSK_WITH_AES_128_CBC_SHA256", supportedOnlyTLS12, false},
+		{TLS_PSK_WITH_CHACHA20_POLY1305, "TLS_PSK_WITH_CHACHA20_POLY1305", supportedOnlyTLS12, false},
 		{TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA, "TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA", supportedOnlyTLS12, false},
 		{TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA, "TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA", supportedOnlyTLS12, false},
 		{TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA384, "TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA384", supportedOnlyTLS12, false},
@@ -92,6 +95,7 @@ func InsecureCipherSuites() []*CipherSuite {
 		{TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA, "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA", supportedUpToTLS12, true},
 		{TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256", supportedOnlyTLS12, true},
 		{TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256, "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", supportedOnlyTLS12, true},
+		{TLS_PSK_WITH_AES_128_CBC_SHA256, "TLS_PSK_WITH_AES_128_CBC_SHA256", supportedOnlyTLS12, true},
 		{TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256, "TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256", supportedOnlyTLS12, true},
 	}
 }
@@ -175,6 +179,9 @@ var cipherSuites = []*cipherSuite{ // TODO: replace with a map, since the order 
 	{TLS_ECDHE_RSA_WITH_RC4_128_SHA, 16, 20, 0, ecdheRSAKA, suiteECDHE, cipherRC4, macSHA1, nil},
 	{TLS_ECDHE_ECDSA_WITH_RC4_128_SHA, 16, 20, 0, ecdheECDSAKA, suiteECDHE | suiteECSign, cipherRC4, macSHA1, nil},
 
+	{TLS_PSK_WITH_AES_128_CBC_SHA, 16, 20, 16, pskKA, suiteNoCerts, cipherAES, macSHA1, nil},
+	{TLS_PSK_WITH_AES_128_CBC_SHA256, 16, 32, 16, pskKA, suiteTLS12 | suiteNoCerts, cipherAES, macSHA256, nil},
+	{TLS_PSK_WITH_CHACHA20_POLY1305, 32, 0, 12, pskKA, suiteTLS12 | suiteNoCerts, nil, nil, aeadChaCha20Poly1305},
 	{TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA, 16, 20, 16, ecdhePSKKA, suiteECDHE | suiteTLS12 | suiteNoCerts, cipherAES, macSHA1, nil},
 	{TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256, 16, 32, 16, ecdhePSKKA, suiteECDHE | suiteTLS12 | suiteNoCerts, cipherAES, macSHA256, nil},
 	{TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA, 32, 20, 16, ecdhePSKKA, suiteECDHE | suiteTLS12 | suiteNoCerts, cipherAES, macSHA1, nil},
@@ -229,65 +236,64 @@ var cipherSuitesTLS13 = []*cipherSuiteTLS13{ // TODO: replace with a map.
 //
 //   - Anything else comes before RC4
 //
-//       RC4 has practically exploitable biases. See https://www.rc4nomore.com.
+//     RC4 has practically exploitable biases. See https://www.rc4nomore.com.
 //
 //   - Anything else comes before CBC_SHA256
 //
-//       SHA-256 variants of the CBC ciphersuites don't implement any Lucky13
-//       countermeasures. See http://www.isg.rhul.ac.uk/tls/Lucky13.html and
-//       https://www.imperialviolet.org/2013/02/04/luckythirteen.html.
+//     SHA-256 variants of the CBC ciphersuites don't implement any Lucky13
+//     countermeasures. See http://www.isg.rhul.ac.uk/tls/Lucky13.html and
+//     https://www.imperialviolet.org/2013/02/04/luckythirteen.html.
 //
 //   - Anything else comes before 3DES
 //
-//       3DES has 64-bit blocks, which makes it fundamentally susceptible to
-//       birthday attacks. See https://sweet32.info.
+//     3DES has 64-bit blocks, which makes it fundamentally susceptible to
+//     birthday attacks. See https://sweet32.info.
 //
 //   - ECDHE comes before anything else
 //
-//       Once we got the broken stuff out of the way, the most important
-//       property a cipher suite can have is forward secrecy. We don't
-//       implement FFDHE, so that means ECDHE.
+//     Once we got the broken stuff out of the way, the most important
+//     property a cipher suite can have is forward secrecy. We don't
+//     implement FFDHE, so that means ECDHE.
 //
 //   - AEADs come before CBC ciphers
 //
-//       Even with Lucky13 countermeasures, MAC-then-Encrypt CBC cipher suites
-//       are fundamentally fragile, and suffered from an endless sequence of
-//       padding oracle attacks. See https://eprint.iacr.org/2015/1129,
-//       https://www.imperialviolet.org/2014/12/08/poodleagain.html, and
-//       https://blog.cloudflare.com/yet-another-padding-oracle-in-openssl-cbc-ciphersuites/.
+//     Even with Lucky13 countermeasures, MAC-then-Encrypt CBC cipher suites
+//     are fundamentally fragile, and suffered from an endless sequence of
+//     padding oracle attacks. See https://eprint.iacr.org/2015/1129,
+//     https://www.imperialviolet.org/2014/12/08/poodleagain.html, and
+//     https://blog.cloudflare.com/yet-another-padding-oracle-in-openssl-cbc-ciphersuites/.
 //
 //   - AES comes before ChaCha20
 //
-//       When AES hardware is available, AES-128-GCM and AES-256-GCM are faster
-//       than ChaCha20Poly1305.
+//     When AES hardware is available, AES-128-GCM and AES-256-GCM are faster
+//     than ChaCha20Poly1305.
 //
-//       When AES hardware is not available, AES-128-GCM is one or more of: much
-//       slower, way more complex, and less safe (because not constant time)
-//       than ChaCha20Poly1305.
+//     When AES hardware is not available, AES-128-GCM is one or more of: much
+//     slower, way more complex, and less safe (because not constant time)
+//     than ChaCha20Poly1305.
 //
-//       We use this list if we think both peers have AES hardware, and
-//       cipherSuitesPreferenceOrderNoAES otherwise.
+//     We use this list if we think both peers have AES hardware, and
+//     cipherSuitesPreferenceOrderNoAES otherwise.
 //
 //   - AES-128 comes before AES-256
 //
-//       The only potential advantages of AES-256 are better multi-target
-//       margins, and hypothetical post-quantum properties. Neither apply to
-//       TLS, and AES-256 is slower due to its four extra rounds (which don't
-//       contribute to the advantages above).
+//     The only potential advantages of AES-256 are better multi-target
+//     margins, and hypothetical post-quantum properties. Neither apply to
+//     TLS, and AES-256 is slower due to its four extra rounds (which don't
+//     contribute to the advantages above).
 //
 //   - ECDSA comes before RSA
 //
-//       The relative order of ECDSA and RSA cipher suites doesn't matter,
-//       as they depend on the certificate. Pick one to get a stable order.
-//
+//     The relative order of ECDSA and RSA cipher suites doesn't matter,
+//     as they depend on the certificate. Pick one to get a stable order.
 var cipherSuitesPreferenceOrder = []uint16{
 	// AEADs w/ ECDHE
 	TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 	TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305, TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
+	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305, TLS_PSK_WITH_CHACHA20_POLY1305, TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
 
 	// CBC w/ ECDHE
-	TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA,
+	TLS_PSK_WITH_AES_128_CBC_SHA, TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA,
 	TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA, TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA,
 	TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA384,
 
@@ -305,7 +311,7 @@ var cipherSuitesPreferenceOrder = []uint16{
 
 	// CBC_SHA256
 	TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-	TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
+	TLS_PSK_WITH_AES_128_CBC_SHA256, TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
 	TLS_RSA_WITH_AES_128_CBC_SHA256,
 
 	// RC4
@@ -315,14 +321,14 @@ var cipherSuitesPreferenceOrder = []uint16{
 
 var cipherSuitesPreferenceOrderNoAES = []uint16{
 	// ChaCha20Poly1305
-	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305, TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
+	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305, TLS_PSK_WITH_CHACHA20_POLY1305, TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
 
 	// AES-GCM w/ ECDHE
 	TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 	TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 
 	// The rest of cipherSuitesPreferenceOrder.
-	TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA,
+	TLS_PSK_WITH_AES_128_CBC_SHA, TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA,
 	TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA, TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA,
 	TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA384,
 
@@ -335,7 +341,7 @@ var cipherSuitesPreferenceOrderNoAES = []uint16{
 	TLS_RSA_WITH_3DES_EDE_CBC_SHA,
 
 	TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-	TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
+	TLS_PSK_WITH_AES_128_CBC_SHA256, TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
 	TLS_RSA_WITH_AES_128_CBC_SHA256,
 	TLS_ECDHE_ECDSA_WITH_RC4_128_SHA, TLS_ECDHE_RSA_WITH_RC4_128_SHA,
 	TLS_RSA_WITH_RC4_128_SHA,
@@ -346,7 +352,7 @@ var cipherSuitesPreferenceOrderNoAES = []uint16{
 var disabledCipherSuites = []uint16{
 	// CBC_SHA256
 	TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-	TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
+	TLS_PSK_WITH_AES_128_CBC_SHA256, TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
 	TLS_RSA_WITH_AES_128_CBC_SHA256,
 
 	// RC4
@@ -629,6 +635,11 @@ func ecdhePSKKA(version uint16) keyAgreement {
 	}
 }
 
+func pskKA(version uint16) keyAgreement {
+	_ = version
+	return pskKeyAgreement{}
+}
+
 // mutualCipherSuite returns a cipherSuite given a list of supported
 // ciphersuites and the id requested by the peer.
 func mutualCipherSuite(have []uint16, want uint16) *cipherSuite {
@@ -697,6 +708,9 @@ const (
 	TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA            uint16 = 0xc036
 	TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256         uint16 = 0xc037
 	TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA384         uint16 = 0xc038
+	TLS_PSK_WITH_AES_128_CBC_SHA                  uint16 = 0x008c
+	TLS_PSK_WITH_AES_128_CBC_SHA256               uint16 = 0x00ae
+	TLS_PSK_WITH_CHACHA20_POLY1305                uint16 = 0xccab
 	TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256   uint16 = 0xcca8
 	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 uint16 = 0xcca9
 	TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256   uint16 = 0xccac

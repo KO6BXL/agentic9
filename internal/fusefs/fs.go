@@ -3,6 +3,7 @@ package fusefs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -42,6 +43,7 @@ func (m *MountManager) Mount(ctx context.Context, profile, agentID, mountpoint s
 	}
 	timeout := 1 * time.Second
 	root := &node{backend: backend, path: "/"}
+	debugEnabled := os.Getenv("AGENTIC9_FUSE_DEBUG") != ""
 	server, err := gofuse.Mount(mountpoint, root, &gofuse.Options{
 		MountOptions: fuse.MountOptions{
 			AllowOther:     false,
@@ -49,7 +51,7 @@ func (m *MountManager) Mount(ctx context.Context, profile, agentID, mountpoint s
 			FsName:         "agentic9",
 			DisableXAttrs:  true,
 			MaxWrite:       128 * 1024,
-			Debug:          false,
+			Debug:          debugEnabled,
 			RememberInodes: true,
 		},
 		EntryTimeout:    &timeout,
@@ -109,6 +111,7 @@ var (
 	_ gofuse.NodeReaddirer  = (*node)(nil)
 	_ gofuse.NodeOpener     = (*node)(nil)
 	_ gofuse.NodeCreater    = (*node)(nil)
+	_ gofuse.NodeMknoder    = (*node)(nil)
 	_ gofuse.NodeMkdirer    = (*node)(nil)
 	_ gofuse.NodeUnlinker   = (*node)(nil)
 	_ gofuse.NodeRmdirer    = (*node)(nil)
@@ -164,13 +167,41 @@ func (n *node) Open(ctx context.Context, flags uint32) (gofuse.FileHandle, uint3
 
 func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, gofuse.FileHandle, uint32, syscall.Errno) {
 	childPath := JoinPath(n.path, name)
+	debugf("Create path=%s flags=%#x mode=%#o", childPath, flags, mode)
 	handle, entry, err := n.backend.Create(ctx, childPath, os.FileMode(mode), flags)
 	if err != nil {
+		debugf("Create error path=%s err=%v", childPath, err)
 		return nil, nil, 0, errno(err)
 	}
 	fillEntry(out, entry)
 	child := &node{backend: n.backend, path: childPath}
 	return n.NewInode(ctx, child, gofuse.StableAttr{Mode: modeBits(entry.Mode)}), &fileHandle{file: handle}, fuse.FOPEN_DIRECT_IO, 0
+}
+
+func (n *node) Mknod(ctx context.Context, name string, mode, dev uint32, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
+	_ = dev
+	childPath := JoinPath(n.path, name)
+	debugf("Mknod path=%s mode=%#o", childPath, mode)
+	fileType := mode & syscall.S_IFMT
+	switch fileType {
+	case 0, syscall.S_IFREG:
+	default:
+		debugf("Mknod unsupported path=%s mode=%#o", childPath, mode)
+		return nil, syscall.ENOSYS
+	}
+
+	handle, entry, err := n.backend.Create(ctx, childPath, os.FileMode(mode), uint32(os.O_WRONLY))
+	if err != nil {
+		debugf("Mknod error path=%s err=%v", childPath, err)
+		return nil, errno(err)
+	}
+	if cerr := handle.Close(); cerr != nil {
+		debugf("Mknod close error path=%s err=%v", childPath, cerr)
+		return nil, errno(cerr)
+	}
+	fillEntry(out, entry)
+	child := &node{backend: n.backend, path: childPath}
+	return n.NewInode(ctx, child, gofuse.StableAttr{Mode: modeBits(entry.Mode)}), 0
 }
 
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
@@ -288,6 +319,12 @@ func errno(err error) syscall.Errno {
 	if err == nil {
 		return 0
 	}
+	if errors.Is(err, exportfs.ErrNotSupported) {
+		return syscall.ENOSYS
+	}
+	if errors.Is(err, exportfs.ErrDisconnected) {
+		return syscall.EIO
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		return syscall.ENOENT
 	}
@@ -333,4 +370,11 @@ func unmountPath(mountpoint string) error {
 		}
 	}
 	return syscall.ENOSYS
+}
+
+func debugf(format string, args ...any) {
+	if os.Getenv("AGENTIC9_FUSE_DEBUG") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "agentic9 fuse: "+format+"\n", args...)
 }

@@ -102,6 +102,111 @@ func (ka rsaKeyAgreement) generateClientKeyExchange(config *Config, clientHello 
 	return preMasterSecret, ckx, nil
 }
 
+type pskKeyAgreement struct{}
+
+func (ka pskKeyAgreement) generateServerKeyExchange(config *Config, cert *Certificate, clientHello *clientHelloMsg, hello *serverHelloMsg) (*serverKeyExchangeMsg, error) {
+	_ = config
+	_ = cert
+	_ = clientHello
+	_ = hello
+
+	skx := new(serverKeyExchangeMsg)
+	// Send an empty PSK identity hint, matching 9front's p9secret usage.
+	skx.key = []byte{0, 0}
+	return skx, nil
+}
+
+func (ka pskKeyAgreement) processClientKeyExchange(config *Config, cert *Certificate, ckx *clientKeyExchangeMsg, version uint16) ([]byte, error) {
+	_ = cert
+	_ = version
+
+	pskConfig, ok := config.Extra.(PSKConfig)
+	if !ok {
+		return nil, errors.New("bad Config - Extra not of type PSKConfig")
+	}
+	if pskConfig.GetKey == nil {
+		return nil, errors.New("bad Config - GetKey required for PSK")
+	}
+	if len(ckx.ciphertext) < 2 {
+		return nil, errClientKeyExchange
+	}
+
+	pskIdentityLen := int(ckx.ciphertext[0])<<8 | int(ckx.ciphertext[1])
+	if len(ckx.ciphertext) != 2+pskIdentityLen {
+		return nil, errClientKeyExchange
+	}
+	pskIdentity := string(ckx.ciphertext[2:])
+	psk, err := pskConfig.GetKey(pskIdentity)
+	if err != nil {
+		return nil, err
+	}
+	return pskPreMasterSecret(psk), nil
+}
+
+func (ka pskKeyAgreement) processServerKeyExchange(config *Config, clientHello *clientHelloMsg, serverHello *serverHelloMsg, cert *x509.Certificate, skx *serverKeyExchangeMsg) error {
+	_ = clientHello
+	_ = serverHello
+	_ = cert
+
+	pskConfig, ok := config.Extra.(PSKConfig)
+	if !ok {
+		return errors.New("bad Config - Extra not of type PSKConfig")
+	}
+	if pskConfig.GetIdentity == nil {
+		return errors.New("bad PSKConfig - GetIdentity required for PSK")
+	}
+	if pskConfig.GetKey == nil {
+		return errors.New("bad Config - GetKey required for PSK")
+	}
+	if len(skx.key) < 2 {
+		return errServerKeyExchange
+	}
+	pskIdentityHintLen := int(skx.key[0])<<8 | int(skx.key[1])
+	if len(skx.key) != 2+pskIdentityHintLen {
+		return errServerKeyExchange
+	}
+	return nil
+}
+
+func (ka pskKeyAgreement) generateClientKeyExchange(config *Config, clientHello *clientHelloMsg, cert *x509.Certificate) ([]byte, *clientKeyExchangeMsg, error) {
+	_ = clientHello
+	_ = cert
+
+	pskConfig, ok := config.Extra.(PSKConfig)
+	if !ok {
+		return nil, nil, errors.New("bad Config - Extra not of type PSKConfig")
+	}
+	if pskConfig.GetIdentity == nil {
+		return nil, nil, errors.New("bad PSKConfig - GetIdentity required for PSK")
+	}
+	if pskConfig.GetKey == nil {
+		return nil, nil, errors.New("bad Config - GetKey required for PSK")
+	}
+
+	pskIdentity := pskConfig.GetIdentity()
+	psk, err := pskConfig.GetKey(pskIdentity)
+	if err != nil {
+		return nil, nil, err
+	}
+	ckx := new(clientKeyExchangeMsg)
+	ckx.ciphertext = make([]byte, 2+len(pskIdentity))
+	ckx.ciphertext[0] = byte(len(pskIdentity) >> 8)
+	ckx.ciphertext[1] = byte(len(pskIdentity))
+	copy(ckx.ciphertext[2:], []byte(pskIdentity))
+	return pskPreMasterSecret(psk), ckx, nil
+}
+
+func pskPreMasterSecret(psk []byte) []byte {
+	pskLen := len(psk)
+	preMasterSecret := make([]byte, 4+2*pskLen)
+	preMasterSecret[0] = byte(pskLen >> 8)
+	preMasterSecret[1] = byte(pskLen)
+	preMasterSecret[2+pskLen] = byte(pskLen >> 8)
+	preMasterSecret[3+pskLen] = byte(pskLen)
+	copy(preMasterSecret[4+pskLen:], psk)
+	return preMasterSecret
+}
+
 // sha1Hash calculates a SHA1 hash over the given byte slices.
 func sha1Hash(slices [][]byte) []byte {
 	hsha1 := sha1.New()

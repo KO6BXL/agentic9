@@ -3,6 +3,7 @@ package exportfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"testing"
@@ -59,6 +60,12 @@ func (s *fakeStream) Read(p []byte) (int, error) {
 }
 
 func (s *fakeStream) Close() error { return nil }
+
+type eofStream struct{}
+
+func (eofStream) Write(p []byte) (int, error) { return len(p), nil }
+func (eofStream) Read(p []byte) (int, error)  { return 0, io.EOF }
+func (eofStream) Close() error                { return nil }
 
 func TestClientListDecodesDirectoryEntriesAndUsesDeterministicFIDs(t *testing.T) {
 	rootQID := ninep.QID{Type: 0x80, Path: 1}
@@ -174,6 +181,94 @@ func TestClientListDecodesDirectoryEntriesAndUsesDeterministicFIDs(t *testing.T)
 
 	if _, err := client.Stat(context.Background(), "/dir"); err != nil {
 		t.Fatalf("Stat: %v", err)
+	}
+	if len(stream.expectations) != 0 {
+		t.Fatalf("unconsumed expectations: %d", len(stream.expectations))
+	}
+}
+
+func TestSymlinkOperationsReturnNotSupported(t *testing.T) {
+	client := New(fakeOpener{stream: &fakeStream{t: t}}, "/remote")
+	if err := client.Symlink(context.Background(), "/target", "/link"); !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("Symlink error = %v, want ErrNotSupported", err)
+	}
+	if _, err := client.Readlink(context.Background(), "/link"); !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("Readlink error = %v, want ErrNotSupported", err)
+	}
+}
+
+func TestClientMarksStreamDisconnected(t *testing.T) {
+	client := New(fakeOpener{stream: eofStream{}}, "/remote")
+	if _, err := client.Stat(context.Background(), "/hello.txt"); !errors.Is(err, ErrDisconnected) {
+		t.Fatalf("first Stat error = %v, want ErrDisconnected", err)
+	}
+	if _, err := client.Stat(context.Background(), "/hello.txt"); !errors.Is(err, ErrDisconnected) {
+		t.Fatalf("second Stat error = %v, want ErrDisconnected", err)
+	}
+}
+
+func TestClientMapsRemoteNotExistErrors(t *testing.T) {
+	stream := &fakeStream{t: t, expectations: []expectation{
+		{
+			reply: ninep.Fcall{Type: ninep.RVERSION, Msize: 8192, Version: "9P2000"},
+		},
+		{
+			reply: ninep.Fcall{Type: ninep.RATTACH, QID: ninep.QID{Type: 0x80, Path: 1}},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TWALK {
+					t.Fatalf("unexpected request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RERROR, Ename: "directory entry not found: './hello.txt'"},
+		},
+	}}
+	client := New(fakeOpener{stream: stream}, "/remote")
+
+	_, err := client.Stat(context.Background(), "/hello.txt")
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestMkdirUsesDirectoryPermBit(t *testing.T) {
+	stream := &fakeStream{t: t, expectations: []expectation{
+		{
+			reply: ninep.Fcall{Type: ninep.RVERSION, Msize: 8192, Version: "9P2000"},
+		},
+		{
+			reply: ninep.Fcall{Type: ninep.RATTACH, QID: ninep.QID{Type: 0x80, Path: 1}},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TWALK || req.FID != 1 || req.NewFID != 2 || len(req.WNames) != 0 {
+					t.Fatalf("unexpected walk request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RWALK, WQIDs: nil},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TSTAT || req.FID != 2 {
+					t.Fatalf("unexpected stat request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RSTAT, Dir: &ninep.Dir{Name: "/", UID: "glenda", GID: "glenda", MUID: "glenda", Mode: 0x80000000 | 0o755}},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TCREATE || req.FID != 2 || req.Name != "child" || req.Perm != 0x80000000|0o755 {
+					t.Fatalf("unexpected create request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RCREATE, QID: ninep.QID{Type: 0x80, Path: 2}},
+		},
+	}}
+	client := New(fakeOpener{stream: stream}, "/remote")
+
+	if err := client.Mkdir(context.Background(), "/child", 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
 	}
 	if len(stream.expectations) != 0 {
 		t.Fatalf("unconsumed expectations: %d", len(stream.expectations))

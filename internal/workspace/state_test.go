@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -30,5 +31,34 @@ func TestManagerRoundTripMetadata(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("Load = %#v, want %#v", got, want)
+	}
+}
+
+func TestValidateAgentID(t *testing.T) {
+	valid := []string{
+		"agent-123",
+		"a",
+		"A_b.c-9",
+	}
+	for _, agentID := range valid {
+		if err := ValidateAgentID(agentID); err != nil {
+			t.Fatalf("ValidateAgentID(%q): %v", agentID, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		".",
+		"..",
+		"/tmp/x",
+		"agent id",
+		"_agent",
+		"-agent",
+		strings.Repeat("a", 65),
+	}
+	for _, agentID := range invalid {
+		if err := ValidateAgentID(agentID); err == nil {
+			t.Fatalf("ValidateAgentID(%q) unexpectedly succeeded", agentID)
+		}
 	}
 }
