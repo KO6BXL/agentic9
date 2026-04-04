@@ -6,6 +6,12 @@ It is intended to be handed to other agents or engineers directly. Every item be
 
 ## Current state
 
+Project stage:
+
+- `agentic9` is currently in **Alpha**
+- the core auth, remote exec, exportfs mount, detached mount helper, and workspace lifecycle flows are implemented
+- local automated coverage is good for the current codebase, but real-host filesystem and durability coverage are still incomplete
+
 Implemented and testable locally:
 
 - config parsing and secret loading in [config.go](/home/me1on/proj/agentic9/internal/config/config.go)
@@ -17,18 +23,24 @@ Implemented and testable locally:
 - exportfs client with listing support in [client.go](/home/me1on/proj/agentic9/internal/exportfs/client.go)
 - Linux FUSE adapter in [fs.go](/home/me1on/proj/agentic9/internal/fusefs/fs.go)
 - detached mount helper lifecycle with runtime PID/state tracking in [main.go](/home/me1on/proj/agentic9/cmd/agentic9/main.go) and [runtime.go](/home/me1on/proj/agentic9/internal/fusefs/runtime.go)
+- CLI workspace lifecycle commands: `profile verify`, `workspace create`, `workspace path`, `mount`, `unmount`, `exec`, and `workspace delete`
 - local fake-stack tests for auth, TLS-PSK rcpu, exec, and exportfs
 
 Already validated:
 
+- `go build ./cmd/agentic9` succeeds locally
 - `go test ./...` passes locally
-- there is an opt-in real-host integration test for `Verify` + simple `Exec` in [integration_test.go](/home/me1on/proj/agentic9/integration/integration_test.go)
+- there are opt-in real-host integration tests for:
+  - `Verify` + simple `Exec`
+  - exportfs create/read/stat/rename/list round-trip
+  - `workspace create` -> mounted file access -> `workspace path` -> `workspace delete` when `AGENTIC9_IT_WORKSPACE=1`
 
-Not yet validated end-to-end:
+Still not broadly validated:
 
-- workspace lifecycle (`workspace create` -> persistent mount -> agent edits -> `workspace delete`)
+- repeated or long-lived mount traffic against a real 9front host
 - exportfs disconnect handling under real mount traffic
 - symlink behavior against a real 9front host
+- failure-path coverage for real-host exec and workspace operations
 
 ## Testing levels available right now
 
@@ -57,7 +69,7 @@ What it does not prove:
 - FUSE stability under real workloads
 - workspace lifecycle correctness
 
-### Level 2: Real-host auth and exec
+### Level 2: Real-host auth, exec, and exportfs round-trip
 
 Command:
 
@@ -75,12 +87,13 @@ What this proves:
 - real `dp9ik` authentication
 - real TLS-PSK `rcpu` handshake
 - simple remote command execution
+- exportfs-backed create/read/stat/rename/list behavior against a real host
 
 What it does not prove:
 
-- exportfs correctness
 - FUSE correctness
-- workspace durability
+- detached workspace durability under repeated real workloads
+- disconnect and symlink behavior
 
 ### Level 3: Manual foreground mount testing
 
@@ -98,30 +111,31 @@ What it does not prove:
 
 ### Level 4: Full agent workflow
 
-This is now implemented locally via detached mount helpers and runtime state, but it is still not validated end-to-end against a real 9front host.
+There is now an opt-in real-host workspace lifecycle test for create/path/delete plus mounted file access when `AGENTIC9_IT_WORKSPACE=1`, but broader long-lived and failure-path validation is still missing.
 
 ## Priority 0: top blockers
 
 These are the most important remaining items to hand off first.
 
-### 0.3 Expand real-host integration beyond verify/exec
+### 0.3 Expand real-host integration beyond the current happy-path coverage
 
 Problem:
 
-- the only real-host integration coverage is [`TestVerifyAndExecAgainstRealHost`](/home/me1on/proj/agentic9/integration/integration_test.go#L15)
-- exportfs, workspace create/delete, and mount behavior are not tested against a real 9front box
+- real-host coverage now exists for verify/exec, exportfs round-trip, and a gated workspace lifecycle path, but it is still concentrated on happy paths
+- mount-backed file operations, disconnect behavior, symlink behavior, and more failure cases are not covered against a real 9front box
 
 Why it matters:
 
 - fake-stack tests are useful, but they do not establish wire compatibility for the filesystem path
+- the current real-host tests are enough to prove basic bring-up, not operational durability
 
 What to do:
 
 - add opt-in real-host integration tests for:
-  - exportfs open + stat + list
-  - remote file read/write through exportfs client
-  - workspace create/delete
   - mount-backed file operations if feasible in CI/manual runs
+  - exportfs disconnect and retry/failure behavior
+  - symlink behavior, or explicit assertion of `ENOSYS`
+  - workspace failure paths and cleanup behavior
 
 Acceptance criteria:
 
@@ -358,4 +372,4 @@ Before handing tasks off, these are the most useful manual checks to run against
 ## Short bug list
 
 - real symlink support is still unimplemented; the current client now returns stable `ENOSYS` behavior through FUSE instead of generic errors.
-- real-host integration only covers verify + simple exec in [integration_test.go](/home/me1on/proj/agentic9/integration/integration_test.go#L15).
+- real-host integration now covers verify/exec, exportfs round-trip, and a gated workspace lifecycle path, but long-lived mount behavior and failure-path coverage are still thin.
