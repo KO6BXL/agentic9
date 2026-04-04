@@ -15,6 +15,8 @@ type Metadata struct {
 	AgentID    string    `json:"agent_id"`
 	RemoteRoot string    `json:"remote_root"`
 	Mountpoint string    `json:"mountpoint"`
+	Mounted    bool      `json:"mounted"`
+	MountPID   int       `json:"mount_pid,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 

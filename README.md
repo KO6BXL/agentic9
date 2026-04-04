@@ -11,15 +11,14 @@ The intended model is:
 
 ## Current status
 
-The project has working local structure, config loading, workspace metadata handling, sync logic, remote-exec framing, a 9P codec/client, and a FUSE adapter.
+The project now has a working end-to-end 9front connection path:
 
-The real 9front network path is not finished yet:
+- real `dp9ik` authentication, including AuthPAK, ticket exchange, authenticator exchange, and TLS session-secret derivation
+- a native TLS-PSK `rcpu` client for `profile verify`, remote `exec`, remote directory setup, and `exportfs`
+- detached mount helpers with runtime PID/state tracking for `workspace create` and `mount --json`
+- local fake-stack tests for auth, exec streaming, callback cancellation, and exportfs open/stat
 
-- `dp9ik` authentication is scaffolded but not implemented end-to-end
-- the native TLS `rcpu` client currently returns `ErrUnimplemented`
-- remote `profile verify`, `exec`, and `mount` flows will stop there today
-
-So the examples below document the intended UX, but the actual 9front connection layer still needs to be completed in `internal/auth/dp9ik` and `internal/transport/tlsrcpu`.
+Remaining work is mostly outside the initial auth/transport bring-up: broader exportfs coverage, more 9P hardening, and fuller integration coverage against real hosts.
 
 ## Install
 
@@ -88,8 +87,7 @@ Intended JSON shape:
 
 Current behavior:
 
-- this validates local config and secret loading
-- the remote auth/transport step currently returns an unimplemented error
+- this performs the real `dp9ik` plus TLS-PSK `rcpu` handshake against the configured host
 
 ### Create a workspace
 
@@ -104,13 +102,13 @@ Current behavior:
 Intended result:
 
 ```json
-{"ok":true,"agent_id":"agent-123","remote_root":"/usr/glenda/agentic9/workspaces/agent-123/root","mountpoint":"/run/user/1000/agentic9/default/agent-123"}
+{"ok":true,"agent_id":"agent-123","remote_root":"/usr/glenda/agentic9/workspaces/agent-123/root","mountpoint":"/run/user/1000/agentic9/default/agent-123","mounted":true,"pid":12345}
 ```
 
 Intended behavior:
 
 - ensure the remote workspace directory exists
-- mount the remote tree locally
+- start a detached mount helper and wait for it to become ready
 - copy the local source tree into the mounted tree
 - write local workspace metadata under `~/.local/state/agentic9/workspaces`
 
@@ -119,6 +117,9 @@ Intended behavior:
 ```bash
 ./agentic9 workspace path --profile default --agent-id agent-123 --json
 ```
+
+When the workspace is mounted, JSON output includes `mounted: true`, `mountpoint`, `remote_root`, and `pid`.
+If the workspace metadata exists but no live mount is present, the command returns `{"ok":false,...,"mounted":false,"error":"workspace is not mounted"}`.
 
 ### Mount an existing workspace
 
@@ -129,6 +130,11 @@ Intended behavior:
   --mountpoint /tmp/agentic9-agent-123 \
   --json
 ```
+
+Behavior:
+
+- with `--json`, `mount` starts a detached helper process, waits for the mount to become ready, and returns the helper PID
+- without `--json`, `mount` stays in the foreground and exits when the mount is unmounted
 
 ### Unmount it
 
@@ -175,14 +181,29 @@ Notes:
 5. Use `agentic9 exec` to run `mk`, tests, or other 9front-side commands.
 6. Delete the workspace when the task is finished.
 
+## Integration test
+
+The integration test is opt-in and runs only when these env vars are set:
+
+```bash
+export AGENTIC9_IT_CPU_HOST='cpu.example.net'
+export AGENTIC9_IT_AUTH_HOST='auth.example.net'
+export AGENTIC9_IT_USER='glenda'
+export AGENTIC9_IT_AUTH_DOMAIN='example.net'
+export AGENTIC9_IT_SECRET='your-9front-secret'
+go test ./integration -v
+```
+
+It performs a real `profile verify`-equivalent handshake and a simple remote `exec` against the target host.
+
 ## Repository layout
 
 ```text
 cmd/agentic9                CLI entrypoint
 internal/config             config parsing and secret loading
-internal/auth/dp9ik         auth packet types and scaffolding
+internal/auth/dp9ik         9front dp9ik auth client, wire types, and AuthPAK
 internal/transport/rcpu     transport interfaces
-internal/transport/tlsrcpu  native 9front client scaffold
+internal/transport/tlsrcpu  native 9front rcpu-over-TLS-PSK client
 internal/remoteexec         rc script generation and sentinel parsing
 internal/ninep              9P message codec and client
 internal/exportfs           exportfs-backed remote filesystem client
@@ -194,12 +215,6 @@ integration/                integration test placeholder
 
 ## What still needs to be finished
 
-The major missing piece is the real 9front wire implementation:
-
-- `dp9ik` auth exchange
-- TLS `rcpu` session setup
-- `exportfs` session plumbing over that transport
-- full remote directory listing and symlink support
-- integration tests against a real 9front host
-
-Once that is in place, the CLI surface in this repo is already structured to expose the intended workflow.
+- broader exportfs coverage, especially symlink behavior and disconnect handling
+- more 9P hardening under sustained or concurrent filesystem traffic
+- broader integration coverage against a real 9front host

@@ -1,474 +1,388 @@
 # TODO
 
-This file is the implementation backlog for turning the current scaffold into a working 9front host tool.
+This file is the current implementation backlog for `agentic9`.
 
-The repo already has:
+It is intended to be handed to other agents or engineers directly. Every item below reflects the current repo state as of the latest local inspection, not the earlier scaffold-only state.
 
-- CLI wiring in [cmd/agentic9/main.go](/home/me1on/proj/agentic9/cmd/agentic9/main.go)
-- config and secret loading in [internal/config/config.go](/home/me1on/proj/agentic9/internal/config/config.go)
-- workspace metadata in [internal/workspace/state.go](/home/me1on/proj/agentic9/internal/workspace/state.go)
-- remote exec script generation and sentinel parsing in [internal/remoteexec/runner.go](/home/me1on/proj/agentic9/internal/remoteexec/runner.go)
-- a 9P codec/client in [internal/ninep/types.go](/home/me1on/proj/agentic9/internal/ninep/types.go), [internal/ninep/codec.go](/home/me1on/proj/agentic9/internal/ninep/codec.go), and [internal/ninep/client.go](/home/me1on/proj/agentic9/internal/ninep/client.go)
-- an exportfs-backed filesystem abstraction in [internal/exportfs/client.go](/home/me1on/proj/agentic9/internal/exportfs/client.go)
-- a Linux FUSE adapter in [internal/fusefs/fs.go](/home/me1on/proj/agentic9/internal/fusefs/fs.go)
-- basic unit tests and a placeholder integration test
+## Current state
 
-The repo does not yet have a functioning 9front connection stack. The main blockers are `dp9ik`, native TLS `rcpu`, and real exportfs session plumbing.
+Implemented and testable locally:
 
-## 1. Implement real `dp9ik` authentication
+- config parsing and secret loading in [config.go](/home/me1on/proj/agentic9/internal/config/config.go)
+- `dp9ik` auth flow in [client.go](/home/me1on/proj/agentic9/internal/auth/dp9ik/client.go)
+- AuthPAK and auth wire helpers in [pak.go](/home/me1on/proj/agentic9/internal/auth/dp9ik/pak.go), [wire.go](/home/me1on/proj/agentic9/internal/auth/dp9ik/wire.go), and [dp9ik.go](/home/me1on/proj/agentic9/internal/auth/dp9ik/dp9ik.go)
+- native TLS-PSK `rcpu` client in [client.go](/home/me1on/proj/agentic9/internal/transport/tlsrcpu/client.go)
+- remote exec framing and sentinel parsing in [runner.go](/home/me1on/proj/agentic9/internal/remoteexec/runner.go)
+- 9P codec and client in [codec.go](/home/me1on/proj/agentic9/internal/ninep/codec.go), [client.go](/home/me1on/proj/agentic9/internal/ninep/client.go), and [dir.go](/home/me1on/proj/agentic9/internal/ninep/dir.go)
+- exportfs client with listing support in [client.go](/home/me1on/proj/agentic9/internal/exportfs/client.go)
+- Linux FUSE adapter in [fs.go](/home/me1on/proj/agentic9/internal/fusefs/fs.go)
+- detached mount helper lifecycle with runtime PID/state tracking in [main.go](/home/me1on/proj/agentic9/cmd/agentic9/main.go) and [runtime.go](/home/me1on/proj/agentic9/internal/fusefs/runtime.go)
+- local fake-stack tests for auth, TLS-PSK rcpu, exec, and exportfs
 
-Status:
+Already validated:
 
-- [internal/auth/dp9ik/dp9ik.go](/home/me1on/proj/agentic9/internal/auth/dp9ik/dp9ik.go) only defines a few packet structs and transcript parsing helpers.
-- No actual auth server dial, AuthPAK exchange, ticket request, authenticator exchange, or secret derivation exists yet.
+- `go test ./...` passes locally
+- there is an opt-in real-host integration test for `Verify` + simple `Exec` in [integration_test.go](/home/me1on/proj/agentic9/integration/integration_test.go)
 
-Why this matters:
+Not yet validated end-to-end:
 
-- Nothing can talk to a real 9front auth server until this is done.
-- `profile verify`, `exec`, and exportfs all depend on it.
+- workspace lifecycle (`workspace create` -> persistent mount -> agent edits -> `workspace delete`)
+- exportfs disconnect handling under real mount traffic
+- symlink behavior against a real 9front host
 
-What to implement:
+## Testing levels available right now
 
-- Add a real client for the 9front auth server ticket service.
-- Marshal and unmarshal the auth protocol structures from `authsrv(6)` completely, not just `TicketReq`.
-- Implement the AuthPAK path used by modern 9front/drawterm auth.
-- Derive the shared secret material required for the TLS-PSK stage used by `rcpu`.
-- Return a typed result that the transport layer can consume directly.
+Use this matrix when deciding what another agent can safely validate.
 
-Recommended shape:
+### Level 1: Local unit and fake-stack tests
 
-- Add an explicit API in [internal/auth/dp9ik/dp9ik.go](/home/me1on/proj/agentic9/internal/auth/dp9ik/dp9ik.go) such as:
-  - `DialAuthServer(ctx, profile)`.
-  - `Authenticate(ctx, profile, secret) (SessionKeys, error)`.
-- Split low-level encoding into separate files if the auth code grows:
-  - `wire.go`
-  - `pak.go`
-  - `client.go`
+Command:
 
-Implementation context:
+```bash
+go test ./...
+```
 
-- The secret loaded from config is a user secret, not a TLS secret yet.
-- The actual handshake logic should follow 9front source behavior, not an inferred approximation.
-- Use 9front/drawterm source as the compatibility oracle for:
-  - `Ticketreq`
-  - `Ticket`
-  - `Authenticator`
-  - AuthPAK message order
-  - shared secret derivation
+What this proves:
 
-Completion criteria:
+- auth packet handling
+- AuthPAK flow against a fake server
+- TLS-PSK rcpu client against a fake server
+- exec output streaming and callback cancellation
+- 9P message encoding/decoding
+- exportfs directory listing logic against a fake 9P stream
 
-- `dp9ik` can talk to a real 9front auth server.
-- It returns the key material needed by the rcpu TLS stage.
-- Add transcript tests from captured or fixture protocol data.
-- Add at least one integration test that verifies auth against a real host.
+What it does not prove:
 
-## 2. Implement native TLS `rcpu` transport
+- compatibility with a real 9front host
+- FUSE stability under real workloads
+- workspace lifecycle correctness
 
-Status:
+### Level 2: Real-host auth and exec
 
-- [internal/transport/tlsrcpu/client.go](/home/me1on/proj/agentic9/internal/transport/tlsrcpu/client.go) validates that the loaded secret is non-empty and then returns `ErrUnimplemented`.
+Command:
 
-Why this matters:
+```bash
+export AGENTIC9_IT_CPU_HOST='...'
+export AGENTIC9_IT_AUTH_HOST='...'
+export AGENTIC9_IT_USER='...'
+export AGENTIC9_IT_AUTH_DOMAIN='...'
+export AGENTIC9_IT_SECRET='...'
+go test ./integration -v
+```
 
-- The CLI cannot verify profiles, run remote commands, create remote directories, or open exportfs sessions until this exists.
+What this proves:
 
-What to implement:
+- real `dp9ik` authentication
+- real TLS-PSK `rcpu` handshake
+- simple remote command execution
 
-- Dial the 9front `cpu` service.
-- Perform the `dp9ik` authentication stage.
-- Establish the TLS-PSK session the 9front `rcpu` flow expects.
-- Implement the remote script execution path used by `Exec`.
-- Implement the exportfs session opener used by `OpenExportFS`.
+What it does not prove:
 
-Specific methods to finish:
+- exportfs correctness
+- FUSE correctness
+- workspace durability
 
-- [Verify](/home/me1on/proj/agentic9/internal/transport/tlsrcpu/client.go:25)
-- [Exec](/home/me1on/proj/agentic9/internal/transport/tlsrcpu/client.go:33)
-- [OpenExportFS](/home/me1on/proj/agentic9/internal/transport/tlsrcpu/client.go:47)
+### Level 3: Manual foreground mount testing
 
-Implementation context:
+Run `agentic9 mount` in one terminal without `--json`, then use the mount from another terminal.
 
-- `remoteexec.Runner` already expects an `rcpu.Executor`.
-- `workspace create` depends on `EnsureRemoteDir`, which calls `Exec`.
-- `exportfs.New(client, remoteRoot)` expects `client.OpenExportFS` to return a live `io.ReadWriteCloser`.
+What this proves:
 
-Important design constraints:
+- exportfs transport is at least alive enough for mount-backed access
+- file browsing and simple file operations can be tried manually
 
-- `Exec` should stream remote output incrementally into the callback.
-- If the callback returns an error, close the remote session immediately.
-- `Verify` should be a cheap end-to-end auth and connection check.
-- Timeouts and cancellation should be driven by `context.Context`.
+What it does not prove:
 
-Completion criteria:
+- persistent detached mount lifecycle
+- agent automation compatibility
 
-- `profile verify --json` succeeds on a real 9front host.
-- `exec --json -- echo ok` streams output and returns a valid exit event.
-- `OpenExportFS` returns a working stream that the 9P client can talk to.
+### Level 4: Full agent workflow
 
-## 3. Make remote `exec` wire-compatible and robust
+This is now implemented locally via detached mount helpers and runtime state, but it is still not validated end-to-end against a real 9front host.
 
-Status:
+## Priority 0: top blockers
 
-- [internal/remoteexec/runner.go](/home/me1on/proj/agentic9/internal/remoteexec/runner.go) builds a remote rc script and parses a sentinel line.
-- The parser tests pass.
-- Command arguments are now rc-quoted individually, with unit coverage for spaces, embedded quotes, empty args, and metacharacters.
+These are the most important remaining items to hand off first.
 
-Why this matters:
+### 0.3 Expand real-host integration beyond verify/exec
 
-- Once transport exists, `exec` becomes the main way agents run tests and builds.
-- Shell quoting bugs here would turn into incorrect or unsafe remote commands.
+Problem:
 
-What to implement:
+- the only real-host integration coverage is [`TestVerifyAndExecAgainstRealHost`](/home/me1on/proj/agentic9/integration/integration_test.go#L15)
+- exportfs, workspace create/delete, and mount behavior are not tested against a real 9front box
 
-- [x] Replace naive `strings.Join(command, " ")` with rc-safe argument quoting for every argument.
-- [x] Confirm the exit sentinel cannot collide with typical command output.
-- Confirm remote errors before the sentinel are surfaced as `client_error`.
-- Add timeout and cancellation tests once transport exists.
+Why it matters:
 
-Specific code to change:
+- fake-stack tests are useful, but they do not establish wire compatibility for the filesystem path
 
-- [BuildScript](/home/me1on/proj/agentic9/internal/remoteexec/runner.go:52)
+What to do:
 
-Implementation context:
+- add opt-in real-host integration tests for:
+  - exportfs open + stat + list
+  - remote file read/write through exportfs client
+  - workspace create/delete
+  - mount-backed file operations if feasible in CI/manual runs
 
-- rc quoting rules are not POSIX shell rules.
-- Do not assume Go’s `shlex`-style helpers apply here.
-- The sentinel parser already handles split frames; keep that behavior intact.
+Acceptance criteria:
 
-Completion criteria:
+- real-host failures in the filesystem path are caught by tests before manual debugging
 
-- Arbitrary arguments round-trip safely through `agentic9 exec -- ...`.
-- Commands containing spaces, quotes, and metacharacters are executed correctly.
-- Integration tests cover success, failure, and mid-stream disconnect.
+## Priority 1: filesystem correctness
 
-## 4. Finish the exportfs-backed filesystem client
+### 1.1 Implement symlink support or return `ENOSYS` cleanly
 
-Status:
+Problem:
 
-- [internal/exportfs/client.go](/home/me1on/proj/agentic9/internal/exportfs/client.go) supports:
-  - `Stat`
-  - `Open`
-  - `Create`
-  - `Mkdir`
-  - `Remove`
-  - `Rename`
-  - `Chmod`
-  - `Truncate`
-- It does not support:
-  - [x] directory listing
-  - symlink creation
-  - symlink reads
-- Several behaviors are too naive for real use.
+- [`Symlink`](/home/me1on/proj/agentic9/internal/exportfs/client.go#L174) and [`Readlink`](/home/me1on/proj/agentic9/internal/exportfs/client.go#L181) are still unimplemented
 
-Why this matters:
+Why it matters:
 
-- The FUSE layer depends on `List` for directory browsing.
-- Sync and normal editor behavior often rely on directory traversal and symlinks.
+- editors, language tools, and source trees sometimes rely on symlinks
+- current FUSE wiring advertises symlink operations via [fs.go](/home/me1on/proj/agentic9/internal/fusefs/fs.go), but the backend does not support them
 
-What to implement:
+What to do:
 
-- [x] Implement `List` by opening a directory and decoding directory entries from 9P `read` responses.
-- Implement `Symlink` and `Readlink` if exportfs/remote fs supports them.
-- Confirm the right mode bits for directories, regular files, and symlinks.
-- Make `Rename` correct for cross-directory moves if 9front `wstat` semantics allow it.
-- [x] Make `walkTo` fid allocation deterministic and collision-safe.
+- determine whether 9front `exportfs` plus the mounted remote filesystem support symlink create/read in the way this client expects
+- if yes, implement both operations
+- if no, map them to stable, explicit errors at the FUSE boundary
 
-Specific methods to finish:
+Acceptance criteria:
 
-- [List](/home/me1on/proj/agentic9/internal/exportfs/client.go:58)
-- [Symlink](/home/me1on/proj/agentic9/internal/exportfs/client.go:148)
-- [Readlink](/home/me1on/proj/agentic9/internal/exportfs/client.go:154)
+- symlink operations either work correctly against a real host or fail predictably with documented behavior
 
-Implementation context:
+### 1.2 Harden exportfs disconnect handling
 
-- Right now `walkTo` derives fids from `time.Now().UnixNano()`. That is not a good long-term allocator.
-- The client holds one cached `*ninep.Client`. If the stream dies, the code currently does not reconnect or mark the mount unhealthy explicitly.
-- `Create` currently returns the directory fid reused as a file handle. Verify that matches 9P semantics for the server you are talking to.
+Problem:
 
-Completion criteria:
+- the exportfs client caches a single `*ninep.Client` in [client.go](/home/me1on/proj/agentic9/internal/exportfs/client.go#L22)
+- if the underlying stream dies, the code does not explicitly poison the mount or turn subsequent filesystem ops into consistent `EIO`
 
-- `ls`, `find`, editors, and `cp -r` work against the FUSE mount.
-- Symlinks behave correctly or are explicitly mapped to `ENOSYS`.
-- Remote disconnects are turned into stable, understandable errors.
+Why it matters:
 
-## 5. Harden the 9P client for real exportfs traffic
+- network failures and server disconnects are normal
+- current behavior is likely to surface as inconsistent low-level errors
 
-Status:
+What to do:
 
-- [internal/ninep/client.go](/home/me1on/proj/agentic9/internal/ninep/client.go) implements a synchronous request/response model with a single mutex.
-- The codec in [internal/ninep/codec.go](/home/me1on/proj/agentic9/internal/ninep/codec.go) covers the subset needed so far.
+- define mount health behavior
+- when the exportfs stream dies:
+  - mark the backend unhealthy
+  - fail subsequent operations consistently
+- wire that into the FUSE errno mapping
 
-Why this matters:
+Acceptance criteria:
 
-- FUSE can issue concurrent operations.
-- exportfs sessions will expose protocol edge cases that the current minimal client does not handle yet.
+- after a forced remote disconnect, new file operations fail consistently and understandably
 
-What to implement:
+### 1.3 Verify rename, create, and file-handle semantics against real 9front exportfs
 
-- [x] Add a proper fid allocator.
-- Add a proper tag allocator.
-- Decide whether to keep the client fully serialized or support concurrent in-flight RPCs with demultiplexing by tag.
-- Validate and negotiate `msize` based on the server response.
-- Improve error reporting on malformed or truncated responses.
-- [x] Add helpers for directory read decoding.
+Problem:
 
-Implementation context:
+- [`Create`](/home/me1on/proj/agentic9/internal/exportfs/client.go#L109) reuses the walked directory fid after `TCREATE`
+- [`Rename`](/home/me1on/proj/agentic9/internal/exportfs/client.go#L141) relies on `wstat` name mutation and may not be correct for cross-directory rename semantics
 
-- A single-mutex client is acceptable for v1 correctness if performance is not the goal.
-- If serialization is kept, document the tradeoff and make sure it does not deadlock under FUSE access patterns.
-- The client currently assumes 9P2000. Confirm that is exactly what 9front exportfs expects in this flow.
+Why it matters:
 
-Completion criteria:
+- these behaviors may compile and pass fake tests while still being wrong against the actual server
 
-- The client is stable under repeated file operations from a mounted workspace.
-- Fid/tag leaks do not occur.
-- Large reads/writes work up to negotiated `msize`.
+What to do:
 
-## 6. Make the FUSE layer correct for real filesystem workloads
+- validate create/open/rename against a real 9front host
+- especially verify:
+  - file handle validity after create
+  - cross-directory rename behavior
+  - truncate/chmod semantics
 
-Status:
+Acceptance criteria:
 
-- [internal/fusefs/fs.go](/home/me1on/proj/agentic9/internal/fusefs/fs.go) mounts a filesystem and wires most expected operations.
-- Several backend operations still rely on incomplete exportfs support.
-- Health handling is minimal.
+- create, overwrite, rename, and truncate behave correctly in manual and integration testing
 
-Why this matters:
+## Priority 2: CLI and workflow hardening
 
-- Editors, build tools, and sync operations will stress the mount harder than the current tests do.
+### 2.1 Make `workspace delete` report partial failures accurately
 
-What to implement:
+Problem:
 
-- Verify `Getattr`, `Lookup`, `Readdir`, `Open`, `Create`, `Setattr`, and `Rename` against real workloads.
-- Ensure failures from a dead exportfs stream are returned as `EIO`.
-- Decide whether the mount should self-poison after stream failure so subsequent ops fail consistently.
-- Audit file handle lifecycle and release semantics.
-- Add explicit `Release` support if needed for cleanup.
+- [`workspaceDelete`](/home/me1on/proj/agentic9/cmd/agentic9/main.go#L167) attempts local unmount, remote delete, and metadata cleanup, but it does not clearly report partial failure states
 
-Implementation context:
+Why it matters:
 
-- `Unmount` shells out to `fusermount3` or `fusermount`; that is acceptable on Linux, but error messages should be improved.
-- `fileHandle.Read` treats `io.EOF` as a normal short read. Keep that behavior.
-- Cache settings are conservative, which is fine for v1.
+- workspace cleanup is operationally sensitive
+- users need to know which part failed
 
-Completion criteria:
+What to do:
 
-- Mounted workspaces behave predictably under `cp`, `mv`, `rm`, editors, and test runners.
-- On forced remote disconnect, new operations fail with `EIO`.
-- Unmount is reliable and idempotent.
+- separate:
+  - local metadata lookup failures
+  - local unmount failures
+  - remote delete failures
+  - metadata deletion failures
+- decide whether JSON output should include per-step status
 
-## 7. Fix workspace lifecycle edge cases
+Acceptance criteria:
 
-Status:
+- failure output makes it clear what was cleaned up and what remains
 
-- [cmd/agentic9/main.go](/home/me1on/proj/agentic9/cmd/agentic9/main.go) implements `workspace create`, `workspace delete`, and `workspace path`.
-- The basic flow exists, but error handling is incomplete and there are some unsafe shortcuts.
+### 2.2 Centralize `agent-id` validation and workspace invariants
 
-Why this matters:
+Problem:
 
-- This is the primary UX agents will depend on.
+- CLI code mostly checks only for non-empty `agent-id`
+- [ValidateAgentID](/home/me1on/proj/agentic9/internal/workspace/state.go) exists but is not used as the central gate
 
-What to implement:
+Why it matters:
 
-- Validate `agent-id` centrally using [ValidateAgentID](/home/me1on/proj/agentic9/internal/workspace/state.go:66) instead of ad hoc string checks.
-- Make `workspace create` clean up partially created mounts and metadata on failure.
-- Make `workspace delete` distinguish:
-  - local unmount failure
-  - remote delete failure
-  - missing metadata
-- Decide whether `mount` should record metadata or remain a transient operation.
-- Consider adding `workspace list` for local state inspection.
+- workspace paths and remote paths are derived from `agent-id`
+- weak validation invites path and state bugs
 
-Implementation context:
+What to do:
 
-- `workspace delete` currently ignores `ErrUnimplemented` from remote delete, which is only there because transport is unfinished.
-- Once transport works, that exception should probably be removed.
-- `workspace create` defers `handle.Close()`, which means the mount is torn down before returning. That is wrong if the intent is a persistent mount after creation.
+- define allowed `agent-id` format
+- validate centrally in one place
+- apply it consistently across:
+  - `workspace create`
+  - `workspace delete`
+  - `workspace path`
+  - `mount`
+  - `exec`
 
-Important bug to fix:
+Acceptance criteria:
 
-- In [workspaceCreate](/home/me1on/proj/agentic9/cmd/agentic9/main.go:87), `defer handle.Close()` unmounts the workspace as soon as the command exits. That defeats the intended workflow and must be redesigned.
+- all commands reject invalid IDs consistently
 
-Recommended fix:
+### 2.3 Tighten JSON output contracts
 
-- Decide whether `workspace create` should:
-  - leave the mount alive in a background process, or
-  - create the workspace and sync without persisting the mount.
-- The current code mixes those two models and needs one consistent choice.
+Problem:
 
-Completion criteria:
+- CLI JSON output exists, but behavior around failures and partial failures is not fully nailed down
 
-- `workspace create` produces a usable workspace outcome.
-- Metadata always reflects reality.
-- Partial failures do not leave confusing local state behind.
+Why it matters:
 
-## 8. Decide and implement mount process ownership
+- agents depend on stable machine-readable output
 
-Status:
+What to do:
 
-- `mount` currently mounts in-process and either returns JSON or blocks in `handle.Wait()`.
-- `workspace create` also mounts in-process, then closes the mount on return.
+- define and test stable JSON shapes for:
+  - `profile verify`
+  - `workspace create`
+  - `workspace delete`
+  - `workspace path`
+  - `mount`
+  - `unmount`
+  - `exec` NDJSON events
+- verify that no stray stderr output corrupts machine-readable mode
 
-Why this matters:
+Acceptance criteria:
 
-- The current code does not provide a stable long-lived mount lifecycle.
-- Agents need a mount that survives the initial CLI process if the workflow is “create then edit”.
+- all `--json` commands have explicit shape tests
 
-What to implement:
+## Priority 3: protocol and 9P hardening
 
-- Choose one ownership model:
-  - foreground `mount` only, and `workspace create` does not leave a mount behind
-  - background daemonized mount process with PID/state tracking
-  - separate helper binary for the long-lived FUSE server
-- Update metadata to record enough information to unmount reliably.
-- Make `unmount` work whether the mount was created directly or via `workspace create`.
+### 3.1 Decide whether the 9P client stays serialized or becomes concurrent
 
-Implementation context:
+Problem:
 
-- The current `Handle.PID()` just returns `os.Getpid()`, which is not enough if a detached mount process is introduced.
-- If daemonizing, store pid/socket/control metadata under the runtime root.
+- the 9P client in [client.go](/home/me1on/proj/agentic9/internal/ninep/client.go) still uses a synchronous request/response model with a single mutex
 
-Completion criteria:
+Why it matters:
 
-- A mount can be created, discovered, and unmounted reliably across CLI invocations.
-- `workspace create` and `mount` do not fight each other.
+- FUSE can drive concurrent operations
+- serialization may be acceptable for correctness, but that needs to be intentional and documented
 
-## 9. Improve sync behavior for bootstrap and mirror mode
+What to do:
 
-Status:
+- choose one:
+  - keep the client serialized and document the tradeoff
+  - add concurrent request handling with tag demultiplexing
+- in either case:
+  - validate `msize` negotiation
+  - tighten malformed-response handling
+  - verify fid/tag cleanup
 
-- [internal/sync/sync.go](/home/me1on/proj/agentic9/internal/sync/sync.go) copies directories, regular files, and symlinks, and skips `.git`.
+Acceptance criteria:
 
-Why this matters:
+- the client behaves predictably under repeated filesystem traffic
 
-- `workspace create` uses this code to seed the remote tree.
+### 3.2 Add more real-host exec coverage
 
-What to implement:
+Problem:
 
-- Add more configurable ignore rules.
-- Preserve executable bits and validate chmod behavior through the mounted remote fs.
-- Improve mirror mode so it is safe and predictable over FUSE.
-- Handle symlink creation errors explicitly if the remote backend does not support them.
-- Add tests around partial sync failures and cleanup behavior.
+- real-host exec coverage is currently just `echo marker`
 
-Implementation context:
+Why it matters:
 
-- Copying via the mounted filesystem means sync correctness depends on FUSE plus exportfs support.
-- Once the mount model is fixed, revisit whether bootstrap should use the mount or a direct remote copy API for better reliability.
+- exec is the main test/build path for agents
 
-Completion criteria:
+What to do:
 
-- A realistic local source tree can be pushed into a new remote workspace.
-- Mirror mode does not accidentally destroy files due to transient mount errors.
+- add real-host tests for:
+  - failing command with non-empty rc status
+  - context cancellation
+  - large output streaming
+  - quoting of arguments with spaces and quotes
 
-## 10. Add real integration tests
+Acceptance criteria:
 
-Status:
+- `exec` behavior is validated under both success and failure cases on a real 9front host
 
-- [integration/integration_test.go](/home/me1on/proj/agentic9/integration/integration_test.go) is only a skipped placeholder.
+## Priority 4: docs and ops
 
-Why this matters:
+### 4.1 Update docs to match the real current state
 
-- The missing pieces are network/protocol heavy. Unit tests alone are not enough.
+Problem:
 
-What to implement:
+- docs improved, but the project has changed fast and the remaining gaps are now different from the original plan
 
-- Add test configuration via env vars, for example:
-  - `AGENTIC9_TEST_CPU_HOST`
-  - `AGENTIC9_TEST_AUTH_HOST`
-  - `AGENTIC9_TEST_USER`
-  - `AGENTIC9_TEST_AUTH_DOMAIN`
-  - `AGENTIC9_TEST_SECRET`
-- Spin up test profiles from env in the integration package.
-- Add end-to-end tests for:
-  - profile verify
-  - exec success
-  - exec failure
-  - workspace create
-  - mount file read/write/rename/delete
-  - remote disconnect handling
-  - workspace delete
+What to do:
 
-Implementation context:
+- keep [README.md](/home/me1on/proj/agentic9/README.md) aligned with:
+  - what is genuinely implemented
+  - what requires manual foreground mount testing
+  - what is not yet durable for agent workflows
+- add a protocol/ops doc if transport debugging becomes frequent
 
-- The tests should skip cleanly when env is absent.
-- Use a dedicated remote test base path so cleanup is safe.
-- Prefer unique agent IDs per test run.
+Acceptance criteria:
 
-Completion criteria:
+- another engineer can tell from docs exactly what is safe to rely on today
 
-- Integration tests validate the full intended workflow against a real 9front machine.
+## Suggested order for parallel agent work
 
-## 11. Tighten CLI behavior and JSON contracts
+These tasks can be given to different agents with minimal overlap:
 
-Status:
+1. Mount lifecycle redesign
+   Scope:
+   - [main.go](/home/me1on/proj/agentic9/cmd/agentic9/main.go)
+   - [fs.go](/home/me1on/proj/agentic9/internal/fusefs/fs.go)
+   - workspace runtime metadata
 
-- CLI subcommands exist, but some runtime semantics are placeholders because transport is missing.
+2. Real-host integration expansion
+   Scope:
+   - [integration_test.go](/home/me1on/proj/agentic9/integration/integration_test.go)
+   - helper fixtures only
 
-Why this matters:
+3. Exportfs symlink and disconnect handling
+   Scope:
+   - [client.go](/home/me1on/proj/agentic9/internal/exportfs/client.go)
+   - [fs.go](/home/me1on/proj/agentic9/internal/fusefs/fs.go)
 
-- Agents depend on stable machine-readable output.
+4. CLI JSON and workspace hardening
+   Scope:
+   - [main.go](/home/me1on/proj/agentic9/cmd/agentic9/main.go)
+   - [state.go](/home/me1on/proj/agentic9/internal/workspace/state.go)
 
-What to implement:
+## Immediate manual checks
 
-- Make all `--json` outputs stable and documented.
-- Ensure command failures return correct local exit codes.
-- Emit structured client-side transport errors consistently.
-- Add tests around flag parsing and JSON output contracts.
+Before handing tasks off, these are the most useful manual checks to run against a real host:
 
-Implementation context:
+1. `agentic9 profile verify --profile <name> --json`
+2. `agentic9 exec --profile <name> --agent-id test --json -- echo ok`
+3. Foreground `agentic9 mount --profile <name> --agent-id test --mountpoint /tmp/a9mnt`
+4. From another shell: `ls`, `cat`, `touch`, `mv`, `rm` under `/tmp/a9mnt`
+5. Confirm whether symlink operations work or fail
 
-- `exec` already emits NDJSON-style events.
-- `profile verify`, `workspace create`, and `unmount` return single JSON objects.
-- Once transport is real, confirm stderr noise never corrupts JSON output.
+## Short bug list
 
-Completion criteria:
-
-- Machine consumers can rely on every `--json` command.
-- Output shape changes are covered by tests.
-
-## 12. Document the real protocol and operational assumptions
-
-Status:
-
-- [README.md](/home/me1on/proj/agentic9/README.md) documents intended usage and current limitations.
-
-Why this matters:
-
-- The next engineer implementing the transport needs precise protocol and deployment notes.
-
-What to implement:
-
-- Add an engineering doc, for example `docs/protocol.md`, that records:
-  - auth flow
-  - rcpu session sequence
-  - exportfs session sequence
-  - expected ports
-  - failure cases
-  - quoting and sentinel rules
-- Add an ops doc with:
-  - required host dependencies on Linux
-  - expected services on the 9front side
-  - example profile setup
-
-Completion criteria:
-
-- A new engineer can implement or debug transport without re-deriving the whole design from source spelunking.
-
-## Suggested implementation order
-
-1. `dp9ik` authentication
-2. native TLS `rcpu` client
-3. exportfs session plumbing
-4. exportfs directory listing and symlink support
-5. mount ownership redesign
-6. workspace lifecycle fixes
-7. integration tests
-8. CLI hardening and docs
-
-## Immediate high-priority bugs
-
-- [workspaceCreate](/home/me1on/proj/agentic9/cmd/agentic9/main.go:125) defers `handle.Close()`, which tears down the mount as the command exits.
-- [tlsrcpu.Client](/home/me1on/proj/agentic9/internal/transport/tlsrcpu/client.go) is still entirely stubbed.
-- [exportfs.Client.List](/home/me1on/proj/agentic9/internal/exportfs/client.go:58) is missing, so `Readdir` cannot work.
-- [integration/integration_test.go](/home/me1on/proj/agentic9/integration/integration_test.go) does not validate anything yet.
+- [`Symlink`](/home/me1on/proj/agentic9/internal/exportfs/client.go#L174) is unimplemented.
+- [`Readlink`](/home/me1on/proj/agentic9/internal/exportfs/client.go#L181) is unimplemented.
+- [`workspaceDelete`](/home/me1on/proj/agentic9/cmd/agentic9/main.go#L167) still does not report partial cleanup failures precisely.
+- real-host integration only covers verify + simple exec in [integration_test.go](/home/me1on/proj/agentic9/integration/integration_test.go#L15).
