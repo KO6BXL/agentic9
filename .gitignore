@@ -1,0 +1,21 @@
+# Build artifacts
+/agentic9
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.out
+
+# Temporary files
+*.tmp
+*.log
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
