@@ -136,8 +136,11 @@ func (c *Client) Create(ctx context.Context, p string, perm os.FileMode, flags u
 }
 
 func (c *Client) Mkdir(ctx context.Context, p string, perm os.FileMode) error {
-	_, _, err := c.Create(ctx, p, perm|os.ModeDir, 0)
-	return c.recordError(err)
+	handle, _, err := c.Create(ctx, p, perm|os.ModeDir, 0)
+	if err != nil {
+		return c.recordError(err)
+	}
+	return handle.Close()
 }
 
 func (c *Client) Remove(ctx context.Context, p string) error {
@@ -343,6 +346,8 @@ func permBits(mode os.FileMode) uint32 {
 
 func withQID(entry Entry, _ ninep.QID) Entry { return entry }
 
+const maxIOChunk = 8000
+
 type remoteFile struct {
 	owner  *Client
 	client *ninep.Client
@@ -350,20 +355,48 @@ type remoteFile struct {
 }
 
 func (f *remoteFile) ReadAt(p []byte, off int64) (int, error) {
-	data, err := f.client.Read(context.Background(), f.fid, uint64(off), uint32(len(p)))
-	if err != nil {
-		return 0, f.owner.recordError(err)
+	total := 0
+	for total < len(p) {
+		chunk := len(p) - total
+		if chunk > maxIOChunk {
+			chunk = maxIOChunk
+		}
+		data, err := f.client.Read(context.Background(), f.fid, uint64(off)+uint64(total), uint32(chunk))
+		if err != nil {
+			if total > 0 {
+				return total, nil
+			}
+			return 0, f.owner.recordError(err)
+		}
+		n := copy(p[total:], data)
+		total += n
+		if n == 0 || len(data) < chunk {
+			break
+		}
 	}
-	n := copy(p, data)
-	if n == 0 {
+	if total == 0 {
 		return 0, io.EOF
 	}
-	return n, nil
+	return total, nil
 }
 
 func (f *remoteFile) WriteAt(p []byte, off int64) (int, error) {
-	n, err := f.client.Write(context.Background(), f.fid, uint64(off), p)
-	return int(n), f.owner.recordError(err)
+	total := 0
+	for total < len(p) {
+		chunk := len(p) - total
+		if chunk > maxIOChunk {
+			chunk = maxIOChunk
+		}
+		n, err := f.client.Write(context.Background(), f.fid, uint64(off)+uint64(total), p[total:total+chunk])
+		total += int(n)
+		if err != nil {
+			return total, f.owner.recordError(err)
+		}
+		if int(n) != chunk {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
 }
 
 func (f *remoteFile) Close() error {

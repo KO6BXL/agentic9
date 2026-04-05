@@ -17,6 +17,7 @@ import (
 	"agentic9/internal/config"
 	"agentic9/internal/exportfs"
 	"agentic9/internal/transport/tlsrcpu"
+	"agentic9/internal/workspace"
 )
 
 func TestVerifyAndExecAgainstRealHost(t *testing.T) {
@@ -141,6 +142,10 @@ func TestWorkspaceCreateDeleteAgainstRealHost(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	runtimeDir := t.TempDir()
+	env := map[string]string{
+		"XDG_RUNTIME_DIR": runtimeDir,
+	}
 
 	sourceDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(sourceDir, "hello.txt"), []byte("workspace integration\n"), 0o644); err != nil {
@@ -149,23 +154,28 @@ func TestWorkspaceCreateDeleteAgainstRealHost(t *testing.T) {
 
 	agentID := uniqueIntegrationID()
 	var createResp struct {
-		OK         bool   `json:"ok"`
-		Mountpoint string `json:"mountpoint"`
-		RemoteRoot string `json:"remote_root"`
-		Mounted    bool   `json:"mounted"`
+		OK                bool   `json:"ok"`
+		ProjectRoot       string `json:"project_root"`
+		Mountpoint        string `json:"mountpoint"`
+		RemoteProjectRoot string `json:"remote_project_root"`
+		SeedPath          string `json:"seed_path"`
+		Mounted           bool   `json:"mounted"`
 	}
-	if err := runCLIJSON(ctx, &createResp, "workspace", "create", "--profile", fixture.ProfileName, "--agent-id", agentID, "--source", sourceDir, "--json"); err != nil {
+	if err := runCLIJSONWithEnv(ctx, env, &createResp, "workspace", "create", "--profile", fixture.ProfileName, "--agent-id", agentID, "--seed-path", sourceDir, "--json"); err != nil {
 		t.Fatalf("workspace create: %v", err)
 	}
 	defer func() {
 		var deleteResp any
-		_ = runCLIJSON(context.Background(), &deleteResp, "workspace", "delete", "--profile", fixture.ProfileName, "--agent-id", agentID, "--json")
+		_ = runCLIJSONWithEnv(context.Background(), env, &deleteResp, "workspace", "delete", "--profile", fixture.ProfileName, "--agent-id", agentID, "--json")
 	}()
-	if !createResp.OK || !createResp.Mounted || createResp.Mountpoint == "" {
+	if !createResp.OK || !createResp.Mounted || createResp.ProjectRoot == "" || createResp.Mountpoint != createResp.ProjectRoot {
 		t.Fatalf("unexpected create response: %#v", createResp)
 	}
+	if createResp.RemoteProjectRoot == "" || createResp.SeedPath != sourceDir {
+		t.Fatalf("unexpected project-root metadata: %#v", createResp)
+	}
 
-	data, err := os.ReadFile(filepath.Join(createResp.Mountpoint, "hello.txt"))
+	data, err := os.ReadFile(filepath.Join(createResp.ProjectRoot, "hello.txt"))
 	if err != nil {
 		t.Fatalf("ReadFile mounted workspace: %v", err)
 	}
@@ -173,16 +183,89 @@ func TestWorkspaceCreateDeleteAgainstRealHost(t *testing.T) {
 		t.Fatalf("mounted file = %q", string(data))
 	}
 
-	var pathResp struct {
-		OK         bool   `json:"ok"`
-		Mountpoint string `json:"mountpoint"`
-		Mounted    bool   `json:"mounted"`
+	publicDir := filepath.Join(createResp.ProjectRoot, "public")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll public: %v", err)
 	}
-	if err := runCLIJSON(ctx, &pathResp, "workspace", "path", "--profile", fixture.ProfileName, "--agent-id", agentID, "--json"); err != nil {
+	indexPath := filepath.Join(publicDir, "index.html")
+	if err := os.WriteFile(indexPath, []byte("<h1>nested write</h1>\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile nested: %v", err)
+	}
+	if err := os.WriteFile(indexPath, []byte("<h1>nested overwrite</h1>\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile nested overwrite: %v", err)
+	}
+	renamedPath := filepath.Join(publicDir, "home.html")
+	if err := os.Rename(indexPath, renamedPath); err != nil {
+		t.Fatalf("Rename nested file: %v", err)
+	}
+	if _, err := os.Stat(renamedPath); err != nil {
+		t.Fatalf("Stat renamed nested file: %v", err)
+	}
+	if err := os.Remove(renamedPath); err != nil {
+		t.Fatalf("Remove renamed nested file: %v", err)
+	}
+	if err := os.WriteFile(indexPath, []byte("<h1>nested recreate</h1>\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile nested recreate: %v", err)
+	}
+
+	var pathResp struct {
+		OK                bool   `json:"ok"`
+		ProjectRoot       string `json:"project_root"`
+		Mountpoint        string `json:"mountpoint"`
+		RemoteProjectRoot string `json:"remote_project_root"`
+		Mounted           bool   `json:"mounted"`
+	}
+	if err := runCLIJSONWithEnv(ctx, env, &pathResp, "workspace", "path", "--profile", fixture.ProfileName, "--agent-id", agentID, "--json"); err != nil {
 		t.Fatalf("workspace path: %v", err)
 	}
-	if !pathResp.OK || !pathResp.Mounted || pathResp.Mountpoint != createResp.Mountpoint {
+	if !pathResp.OK || !pathResp.Mounted || pathResp.ProjectRoot != createResp.ProjectRoot || pathResp.Mountpoint != createResp.Mountpoint || pathResp.RemoteProjectRoot != createResp.RemoteProjectRoot {
 		t.Fatalf("unexpected path response: %#v", pathResp)
+	}
+
+	manager, err := workspace.NewManager((&config.Config{}).StateRoot())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := os.Remove(manager.Path(fixture.ProfileName, agentID)); err != nil {
+		t.Fatalf("Remove metadata file: %v", err)
+	}
+	var recoveredPathResp struct {
+		OK          bool   `json:"ok"`
+		ProjectRoot string `json:"project_root"`
+		Mountpoint  string `json:"mountpoint"`
+		Mounted     bool   `json:"mounted"`
+	}
+	if err := runCLIJSONWithEnv(ctx, env, &recoveredPathResp, "workspace", "path", "--profile", fixture.ProfileName, "--agent-id", agentID, "--json"); err != nil {
+		t.Fatalf("workspace path after metadata removal: %v", err)
+	}
+	if !recoveredPathResp.OK || !recoveredPathResp.Mounted || recoveredPathResp.ProjectRoot != createResp.ProjectRoot || recoveredPathResp.Mountpoint != createResp.Mountpoint {
+		t.Fatalf("unexpected recovered path response: %#v", recoveredPathResp)
+	}
+
+	var statusResp struct {
+		OK       bool `json:"ok"`
+		Mounted  bool `json:"mounted"`
+		Metadata struct {
+			Present bool `json:"present"`
+		} `json:"metadata"`
+		Runtime struct {
+			Present      bool `json:"present"`
+			ProcessAlive bool `json:"process_alive"`
+		} `json:"runtime"`
+		Remote struct {
+			Checked bool   `json:"checked"`
+			Exists  bool   `json:"exists"`
+			Error   string `json:"error"`
+		} `json:"remote"`
+	}
+	if err := runCLIJSONWithEnv(ctx, env, &statusResp, "workspace", "status", "--profile", fixture.ProfileName, "--agent-id", agentID, "--json"); err != nil {
+		t.Fatalf("workspace status: %v", err)
+	}
+	if !statusResp.OK || !statusResp.Mounted || !statusResp.Metadata.Present || !statusResp.Runtime.Present || !statusResp.Runtime.ProcessAlive {
+		t.Fatalf("unexpected status response: %#v", statusResp)
+	}
+	if !statusResp.Remote.Checked || !statusResp.Remote.Exists || statusResp.Remote.Error != "" {
+		t.Fatalf("unexpected remote status: %#v", statusResp.Remote)
 	}
 
 	var deleteResp struct {
@@ -191,7 +274,7 @@ func TestWorkspaceCreateDeleteAgainstRealHost(t *testing.T) {
 			Status string `json:"status"`
 		} `json:"remote_delete"`
 	}
-	if err := runCLIJSON(ctx, &deleteResp, "workspace", "delete", "--profile", fixture.ProfileName, "--agent-id", agentID, "--json"); err != nil {
+	if err := runCLIJSONWithEnv(ctx, env, &deleteResp, "workspace", "delete", "--profile", fixture.ProfileName, "--agent-id", agentID, "--json"); err != nil {
 		t.Fatalf("workspace delete: %v", err)
 	}
 	if !deleteResp.OK || deleteResp.RemoteDelete.Status != "ok" {
@@ -258,10 +341,17 @@ func loadIntegrationFixtureFromEnv() (integrationFixture, bool) {
 }
 
 func runCLIJSON(ctx context.Context, dst any, args ...string) error {
+	return runCLIJSONWithEnv(ctx, nil, dst, args...)
+}
+
+func runCLIJSONWithEnv(ctx context.Context, extraEnv map[string]string, dst any, args ...string) error {
 	cmdArgs := append([]string{"run", "./cmd/agentic9"}, args...)
 	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
 	cmd.Dir = filepath.Join("..")
 	cmd.Env = os.Environ()
+	for key, value := range extraEnv {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError

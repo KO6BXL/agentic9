@@ -1,6 +1,8 @@
 package syncdir
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -39,7 +41,7 @@ func CopyTree(src, dst string, opts Options) error {
 		}
 		switch {
 		case info.Mode().IsDir():
-			return os.MkdirAll(target, info.Mode().Perm())
+			return ensureDir(target, info.Mode().Perm())
 		case info.Mode()&os.ModeSymlink != 0:
 			link, err := os.Readlink(path)
 			if err != nil {
@@ -48,7 +50,7 @@ func CopyTree(src, dst string, opts Options) error {
 			_ = os.Remove(target)
 			return os.Symlink(link, target)
 		case info.Mode().IsRegular():
-			return copyFile(path, target, info.Mode().Perm())
+			return copyFile(path, target, dst, info.Mode().Perm())
 		default:
 			return nil
 		}
@@ -74,9 +76,12 @@ func CopyTree(src, dst string, opts Options) error {
 	return nil
 }
 
-func copyFile(src, dst string, mode fs.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+func copyFile(src, dst, root string, mode fs.FileMode) error {
+	parent := filepath.Dir(dst)
+	if parent != root {
+		if err := ensureDir(parent, 0o755); err != nil {
+			return err
+		}
 	}
 	in, err := os.Open(src)
 	if err != nil {
@@ -90,6 +95,21 @@ func copyFile(src, dst string, mode fs.FileMode) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+func ensureDir(path string, mode fs.FileMode) error {
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+		if info.IsDir() {
+			return nil
+		}
+		return fmt.Errorf("mkdir %s: %w", path, fs.ErrExist)
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	default:
+		return os.MkdirAll(path, mode)
+	}
 }
 
 func skip(rel string) bool {

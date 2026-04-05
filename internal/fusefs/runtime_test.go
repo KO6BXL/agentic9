@@ -97,3 +97,39 @@ func TestRuntimeWaitForMountFailure(t *testing.T) {
 		t.Fatalf("WaitForMount error = %v, want boom", err)
 	}
 }
+
+func TestRuntimeList(t *testing.T) {
+	runtime := NewRuntime(t.TempDir())
+	states := []MountState{
+		{
+			Profile:    "default",
+			AgentID:    "agent-b",
+			Mountpoint: "/tmp/b",
+			PID:        1002,
+			Status:     MountStatusMounted,
+		},
+		{
+			Profile:    "default",
+			AgentID:    "agent-a",
+			Mountpoint: "/tmp/a",
+			PID:        1001,
+			Status:     MountStatusMounted,
+		},
+	}
+	for _, state := range states {
+		if err := runtime.Save(state); err != nil {
+			t.Fatalf("Save(%s): %v", state.Mountpoint, err)
+		}
+	}
+
+	got, err := runtime.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(List()) = %d, want 2", len(got))
+	}
+	if got[0].Mountpoint != "/tmp/a" || got[1].Mountpoint != "/tmp/b" {
+		t.Fatalf("unexpected order: %#v", got)
+	}
+}

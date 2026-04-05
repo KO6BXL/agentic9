@@ -59,6 +59,10 @@ func (m *Manager) Delete(profile, agentID string) error {
 	return os.Remove(m.path(profile, agentID))
 }
 
+func (m *Manager) Path(profile, agentID string) string {
+	return m.path(profile, agentID)
+}
+
 func (m *Manager) path(profile, agentID string) string {
 	return filepath.Join(m.root, profile, agentID+".json")
 }

@@ -8,14 +8,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"agentic9/internal/buildinfo"
 	"agentic9/internal/config"
 	"agentic9/internal/exportfs"
 	"agentic9/internal/fusefs"
@@ -34,9 +38,11 @@ func main() {
 		"workspace create": workspaceCreate,
 		"workspace delete": workspaceDelete,
 		"workspace path":   workspacePath,
+		"workspace status": workspaceStatus,
 		"mount":            mountWorkspace,
 		"unmount":          unmountWorkspace,
 		"exec":             execRemote,
+		"version":          printVersion,
 		"__serve-mount":    serveMount,
 	}
 	if err := dispatch(ctx, os.Args[1:], commands); err != nil {
@@ -51,7 +57,7 @@ func main() {
 
 func dispatch(ctx context.Context, args []string, commands map[string]command) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentic9 <profile verify|workspace create|workspace delete|workspace path|mount|unmount|exec>")
+		return errors.New("usage: agentic9 <profile verify|workspace create|workspace delete|workspace path|workspace status|mount|unmount|exec|version>")
 	}
 	if len(args) >= 2 {
 		if cmd, ok := commands[strings.Join(args[:2], " ")]; ok {
@@ -62,6 +68,22 @@ func dispatch(ctx context.Context, args []string, commands map[string]command) e
 		return cmd(ctx, args[1:])
 	}
 	return fmt.Errorf("unknown command: %s", strings.Join(args, " "))
+}
+
+func printVersion(ctx context.Context, args []string) error {
+	_ = ctx
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonOut := fs.Bool("json", false, "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	info := versionInfo()
+	if *jsonOut {
+		return writeJSON(info)
+	}
+	fmt.Printf("agentic9 %s\nexpected skill version %s\n", info.CLIVersion, info.ExpectedSkillVersion)
+	return nil
 }
 
 func profileVerify(ctx context.Context, args []string) error {
@@ -102,19 +124,29 @@ func workspaceCreate(ctx context.Context, args []string) error {
 	profileName := fs.String("profile", "default", "")
 	agentID := fs.String("agent-id", "", "")
 	source := fs.String("source", "", "")
+	seedPath := fs.String("seed-path", "", "")
 	mountpoint := fs.String("mountpoint", "", "")
+	projectRoot := fs.String("project-root", "", "")
 	mirror := fs.Bool("mirror", false, "")
 	jsonOut := fs.Bool("json", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *agentID == "" || *source == "" {
-		return errors.New("workspace create requires --agent-id and --source")
+	resolvedSource, err := resolveAliasedPathFlag("--source", *source, "--seed-path", *seedPath)
+	if err != nil {
+		return err
+	}
+	resolvedProjectRoot, err := resolveAliasedPathFlag("--mountpoint", *mountpoint, "--project-root", *projectRoot)
+	if err != nil {
+		return err
+	}
+	if *agentID == "" || resolvedSource == "" {
+		return errors.New("workspace create requires --agent-id and one of --seed-path or --source")
 	}
 	if err := workspace.ValidateAgentID(*agentID); err != nil {
 		return err
 	}
-	sourcePath, err := filepath.Abs(*source)
+	sourcePath, err := filepath.Abs(resolvedSource)
 	if err != nil {
 		return err
 	}
@@ -134,7 +166,17 @@ func workspaceCreate(ctx context.Context, args []string) error {
 	if err := client.EnsureRemoteDir(ctx, remoteRoot); err != nil {
 		return err
 	}
-	mp := *mountpoint
+	createdEmptyRemoteRoot, err := remoteDirectoryIsEmpty(ctx, client, remoteRoot)
+	if err != nil {
+		return err
+	}
+	if err := copyTreeToRemote(ctx, sourcePath, client, remoteRoot, syncdir.Options{Mirror: *mirror}); err != nil {
+		if createdEmptyRemoteRoot {
+			_ = client.RemoveRemoteTree(context.Background(), remoteRoot)
+		}
+		return err
+	}
+	mp := resolvedProjectRoot
 	if mp == "" {
 		mp, err = workspace.DefaultMountpoint(*profileName, *agentID)
 		if err != nil {
@@ -146,14 +188,23 @@ func workspaceCreate(ctx context.Context, args []string) error {
 	}
 	state, err := startDetachedMount(ctx, cfg, *profileName, *agentID, mp)
 	if err != nil {
+		if createdEmptyRemoteRoot {
+			_ = client.RemoveRemoteTree(context.Background(), remoteRoot)
+		}
 		return err
 	}
-	if err := copyTreeWithRetry(ctx, sourcePath, mp, syncdir.Options{Mirror: *mirror}); err != nil {
+	if err := waitForWritableMount(ctx, mp); err != nil {
 		_ = stopDetachedMount(cfg.RuntimeRoot(), mp)
+		if createdEmptyRemoteRoot {
+			_ = client.RemoveRemoteTree(context.Background(), remoteRoot)
+		}
 		return err
 	}
 	if err := saveWorkspaceMetadata(manager, *profileName, *agentID, remoteRoot, mp, state.PID); err != nil {
 		_ = stopDetachedMount(cfg.RuntimeRoot(), mp)
+		if createdEmptyRemoteRoot {
+			_ = client.RemoveRemoteTree(context.Background(), remoteRoot)
+		}
 		return err
 	}
 	if *jsonOut {
@@ -195,7 +246,7 @@ func workspaceDelete(ctx context.Context, args []string) error {
 		RemoteDelete:   skippedStep("not attempted"),
 		Metadata:       skippedStep("not attempted"),
 	}
-	meta, loadErr := manager.Load(*profileName, *agentID)
+	meta, loadErr := loadWorkspaceMetadata(cfg.RuntimeRoot(), manager, profile, *profileName, *agentID)
 	metaFound := false
 	switch {
 	case loadErr == nil:
@@ -295,7 +346,7 @@ func workspacePath(ctx context.Context, args []string) error {
 	if err := workspace.ValidateAgentID(*agentID); err != nil {
 		return err
 	}
-	cfg, _, _, err := loadProfile(*profileName)
+	cfg, profile, _, err := loadProfile(*profileName)
 	if err != nil {
 		return err
 	}
@@ -303,8 +354,21 @@ func workspacePath(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	meta, err := manager.Load(*profileName, *agentID)
+	meta, err := loadWorkspaceMetadata(cfg.RuntimeRoot(), manager, profile, *profileName, *agentID)
 	if err != nil {
+		if *jsonOut && errors.Is(err, os.ErrNotExist) {
+			return writeJSON(map[string]any{
+				"ok":                  false,
+				"agent_id":            *agentID,
+				"remote_root":         workspace.RemoteRoot(profile, *agentID),
+				"remote_project_root": workspace.RemoteRoot(profile, *agentID),
+				"edit_path":           "",
+				"mountpoint":          "",
+				"project_root":        "",
+				"mounted":             false,
+				"error":               "workspace metadata and active mount state not found",
+			})
+		}
 		return err
 	}
 	meta, err = refreshWorkspaceMetadata(cfg.RuntimeRoot(), manager, meta)
@@ -315,29 +379,106 @@ func workspacePath(ctx context.Context, args []string) error {
 		err := errors.New("workspace is not mounted")
 		if *jsonOut {
 			return writeJSON(map[string]any{
-				"ok":          false,
-				"agent_id":    meta.AgentID,
-				"remote_root": meta.RemoteRoot,
-				"edit_path":   "",
-				"mountpoint":  "",
-				"mounted":     false,
-				"error":       err.Error(),
+				"ok":                  false,
+				"agent_id":            meta.AgentID,
+				"remote_root":         meta.RemoteRoot,
+				"remote_project_root": meta.RemoteRoot,
+				"edit_path":           "",
+				"mountpoint":          "",
+				"project_root":        "",
+				"mounted":             false,
+				"error":               err.Error(),
 			})
 		}
 		return err
 	}
 	if *jsonOut {
 		return writeJSON(map[string]any{
-			"ok":          true,
-			"agent_id":    meta.AgentID,
-			"edit_path":   meta.Mountpoint,
-			"mountpoint":  meta.Mountpoint,
-			"remote_root": meta.RemoteRoot,
-			"mounted":     true,
-			"pid":         meta.MountPID,
+			"ok":                  true,
+			"agent_id":            meta.AgentID,
+			"edit_path":           meta.Mountpoint,
+			"mountpoint":          meta.Mountpoint,
+			"project_root":        meta.Mountpoint,
+			"remote_root":         meta.RemoteRoot,
+			"remote_project_root": meta.RemoteRoot,
+			"mounted":             true,
+			"pid":                 meta.MountPID,
 		})
 	}
 	fmt.Println(meta.Mountpoint)
+	return nil
+}
+
+func workspaceStatus(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("workspace status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	profileName := fs.String("profile", "default", "")
+	agentID := fs.String("agent-id", "", "")
+	jsonOut := fs.Bool("json", false, "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *agentID == "" {
+		return errors.New("workspace status requires --agent-id")
+	}
+	if err := workspace.ValidateAgentID(*agentID); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load("")
+	if err != nil {
+		return err
+	}
+	profile, err := cfg.Profile(*profileName)
+	if err != nil {
+		return err
+	}
+	manager, err := workspace.NewManager(cfg.StateRoot())
+	if err != nil {
+		return err
+	}
+	report, err := inspectWorkspaceState(cfg.RuntimeRoot(), manager, profile, *profileName, *agentID)
+	if err != nil {
+		return err
+	}
+	report.Version = versionInfo()
+
+	secret, secretErr := cfg.LoadSecret(*profileName)
+	switch {
+	case secretErr != nil:
+		report.Remote.Checked = false
+		report.Remote.Error = secretErr.Error()
+	default:
+		checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		exists, err := remoteWorkspaceExists(checkCtx, profile, secret, report.Remote.Root)
+		report.Remote.Checked = true
+		report.Remote.Exists = exists
+		report.Remote.Error = errString(err)
+	}
+
+	if *jsonOut {
+		return writeJSON(report)
+	}
+
+	fmt.Printf("agentic9 %s\n", report.Version.CLIVersion)
+	fmt.Printf("workspace %s/%s\n", report.Profile, report.AgentID)
+	fmt.Printf("project_root: %s\n", emptyDash(report.ProjectRoot))
+	fmt.Printf("mounted: %t\n", report.Mounted)
+	fmt.Printf("metadata present: %t\n", report.Metadata.Present)
+	fmt.Printf("runtime present: %t\n", report.Runtime.Present)
+	if report.Runtime.Present {
+		fmt.Printf("runtime status: %s\n", report.Runtime.Status)
+		fmt.Printf("runtime pid alive: %t\n", report.Runtime.ProcessAlive)
+	}
+	if report.Remote.Checked {
+		fmt.Printf("remote exists: %t\n", report.Remote.Exists)
+	} else {
+		fmt.Printf("remote exists: unknown (%s)\n", report.Remote.Error)
+	}
+	for _, inconsistency := range report.Inconsistencies {
+		fmt.Printf("warning: %s\n", inconsistency)
+	}
 	return nil
 }
 
@@ -347,12 +488,17 @@ func mountWorkspace(ctx context.Context, args []string) error {
 	profileName := fs.String("profile", "default", "")
 	agentID := fs.String("agent-id", "", "")
 	mountpoint := fs.String("mountpoint", "", "")
+	projectRoot := fs.String("project-root", "", "")
 	jsonOut := fs.Bool("json", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *agentID == "" || *mountpoint == "" {
-		return errors.New("mount requires --agent-id and --mountpoint")
+	resolvedProjectRoot, err := resolveAliasedPathFlag("--mountpoint", *mountpoint, "--project-root", *projectRoot)
+	if err != nil {
+		return err
+	}
+	if *agentID == "" || resolvedProjectRoot == "" {
+		return errors.New("mount requires --agent-id and one of --project-root or --mountpoint")
 	}
 	if err := workspace.ValidateAgentID(*agentID); err != nil {
 		return err
@@ -361,36 +507,39 @@ func mountWorkspace(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(*mountpoint, 0o755); err != nil {
+	if err := os.MkdirAll(resolvedProjectRoot, 0o755); err != nil {
 		return err
 	}
 	if *jsonOut {
-		state, err := startDetachedMount(ctx, cfg, *profileName, *agentID, *mountpoint)
+		state, err := startDetachedMount(ctx, cfg, *profileName, *agentID, resolvedProjectRoot)
 		if err != nil {
 			return err
 		}
 		manager, err := workspace.NewManager(cfg.StateRoot())
 		if err != nil {
-			_ = stopDetachedMount(cfg.RuntimeRoot(), *mountpoint)
+			_ = stopDetachedMount(cfg.RuntimeRoot(), resolvedProjectRoot)
 			return err
 		}
-		if err := saveWorkspaceMetadata(manager, *profileName, *agentID, workspace.RemoteRoot(profile, *agentID), *mountpoint, state.PID); err != nil {
-			_ = stopDetachedMount(cfg.RuntimeRoot(), *mountpoint)
+		if err := saveWorkspaceMetadata(manager, *profileName, *agentID, workspace.RemoteRoot(profile, *agentID), resolvedProjectRoot, state.PID); err != nil {
+			_ = stopDetachedMount(cfg.RuntimeRoot(), resolvedProjectRoot)
 			return err
 		}
 		return writeJSON(map[string]any{
-			"ok":         true,
-			"agent_id":   *agentID,
-			"profile":    *profileName,
-			"mountpoint": *mountpoint,
-			"pid":        state.PID,
-			"mounted":    true,
+			"ok":                  true,
+			"agent_id":            *agentID,
+			"profile":             *profileName,
+			"mountpoint":          resolvedProjectRoot,
+			"project_root":        resolvedProjectRoot,
+			"remote_root":         workspace.RemoteRoot(profile, *agentID),
+			"remote_project_root": workspace.RemoteRoot(profile, *agentID),
+			"pid":                 state.PID,
+			"mounted":             true,
 		})
 	}
 	client := tlsrcpu.NewClient(profile, secret)
 	exp := exportfs.New(client, workspace.RemoteRoot(profile, *agentID))
 	mounter := fusefs.NewMountManager(cfg.RuntimeRoot())
-	handle, err := mounter.Mount(ctx, *profileName, *agentID, *mountpoint, exp)
+	handle, err := mounter.Mount(ctx, *profileName, *agentID, resolvedProjectRoot, exp)
 	if err != nil {
 		return err
 	}
@@ -402,16 +551,21 @@ func unmountWorkspace(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("unmount", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	mountpoint := fs.String("mountpoint", "", "")
+	projectRoot := fs.String("project-root", "", "")
 	jsonOut := fs.Bool("json", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *mountpoint == "" {
-		return errors.New("unmount requires --mountpoint")
+	resolvedProjectRoot, err := resolveAliasedPathFlag("--mountpoint", *mountpoint, "--project-root", *projectRoot)
+	if err != nil {
+		return err
+	}
+	if resolvedProjectRoot == "" {
+		return errors.New("unmount requires one of --project-root or --mountpoint")
 	}
 	runtime := fusefs.NewRuntime(config.DefaultRuntimeRoot())
-	state, loadErr := runtime.Load(*mountpoint)
-	err := stopDetachedMount(config.DefaultRuntimeRoot(), *mountpoint)
+	state, loadErr := runtime.Load(resolvedProjectRoot)
+	err = stopDetachedMount(config.DefaultRuntimeRoot(), resolvedProjectRoot)
 	if err == nil && loadErr == nil && state.Profile != "" && state.AgentID != "" {
 		manager, mgrErr := workspace.NewManager((&config.Config{}).StateRoot())
 		if mgrErr == nil {
@@ -419,7 +573,12 @@ func unmountWorkspace(ctx context.Context, args []string) error {
 		}
 	}
 	if *jsonOut {
-		return writeJSON(map[string]any{"ok": err == nil, "mountpoint": *mountpoint, "error": errString(err)})
+		return writeJSON(map[string]any{
+			"ok":           err == nil,
+			"mountpoint":   resolvedProjectRoot,
+			"project_root": resolvedProjectRoot,
+			"error":        errString(err),
+		})
 	}
 	return err
 }
@@ -456,9 +615,10 @@ func execRemote(ctx context.Context, args []string) error {
 	outputRouter := newExecOutputRouter(*jsonOut)
 	if *jsonOut {
 		_ = writeJSON(map[string]any{
-			"type":      "start",
-			"workspace": workspace.RemoteRoot(profile, *agentID),
-			"command":   cmdArgs,
+			"type":                "start",
+			"workspace":           workspace.RemoteRoot(profile, *agentID),
+			"remote_project_root": workspace.RemoteRoot(profile, *agentID),
+			"command":             cmdArgs,
 		})
 	}
 	result, err := runner.Run(ctx, cmdArgs, outputRouter.Write)
@@ -590,20 +750,26 @@ func classifyExecWarning(line []byte) (execWarning, bool) {
 }
 
 func workspaceCreateJSON(agentID, remoteRoot, mountpoint, sourcePath string, pid int, mirror bool) map[string]any {
-	syncMode := "copy-once"
+	bootstrapMode := "copy-once"
 	if mirror {
-		syncMode = "mirror-once"
+		bootstrapMode = "mirror-once"
 	}
 	return map[string]any{
-		"ok":          true,
-		"agent_id":    agentID,
-		"remote_root": remoteRoot,
-		"mountpoint":  mountpoint,
-		"edit_path":   mountpoint,
-		"source_path": sourcePath,
-		"sync_mode":   syncMode,
-		"mounted":     true,
-		"pid":         pid,
+		"ok":                     true,
+		"agent_id":               agentID,
+		"cli_version":            buildinfo.CLIVersion,
+		"expected_skill_version": buildinfo.SkillVersion,
+		"remote_root":            remoteRoot,
+		"remote_project_root":    remoteRoot,
+		"mountpoint":             mountpoint,
+		"edit_path":              mountpoint,
+		"project_root":           mountpoint,
+		"source_path":            sourcePath,
+		"seed_path":              sourcePath,
+		"sync_mode":              bootstrapMode,
+		"bootstrap_mode":         bootstrapMode,
+		"mounted":                true,
+		"pid":                    pid,
 	}
 }
 
@@ -723,6 +889,16 @@ func clearWorkspaceMountState(manager *workspace.Manager, profileName, agentID s
 
 func refreshWorkspaceMetadata(runtimeRoot string, manager *workspace.Manager, meta workspace.Metadata) (workspace.Metadata, error) {
 	if !meta.Mounted || meta.Mountpoint == "" || meta.MountPID == 0 {
+		if state, ok, err := findMountedRuntimeStateByAgent(runtimeRoot, meta.Profile, meta.AgentID, meta.Mountpoint); err != nil {
+			return meta, err
+		} else if ok {
+			meta.Mountpoint = state.Mountpoint
+			meta.Mounted = true
+			meta.MountPID = state.PID
+			if saveErr := manager.Save(meta); saveErr != nil {
+				return meta, saveErr
+			}
+		}
 		return meta, nil
 	}
 	runtime := fusefs.NewRuntime(runtimeRoot)
@@ -732,6 +908,17 @@ func refreshWorkspaceMetadata(runtimeRoot string, manager *workspace.Manager, me
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return meta, err
+	}
+	if recovered, ok, findErr := findMountedRuntimeStateByAgent(runtimeRoot, meta.Profile, meta.AgentID, meta.Mountpoint); findErr != nil {
+		return meta, findErr
+	} else if ok {
+		meta.Mountpoint = recovered.Mountpoint
+		meta.MountPID = recovered.PID
+		meta.Mounted = true
+		if saveErr := manager.Save(meta); saveErr != nil {
+			return meta, saveErr
+		}
+		return meta, nil
 	}
 	meta.Mounted = false
 	meta.MountPID = 0
@@ -851,6 +1038,206 @@ func copyTreeWithRetry(ctx context.Context, src, dst string, opts syncdir.Option
 	return err
 }
 
+func waitForWritableMount(ctx context.Context, mountpoint string) error {
+	probePath := filepath.Join(mountpoint, fmt.Sprintf(".agentic9-ready-%d", os.Getpid()))
+	var err error
+	for attempt := 0; attempt < 50; attempt++ {
+		err = probeWritableMount(probePath)
+		if err == nil {
+			return nil
+		}
+		if !isRetriableMountReadyError(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return err
+}
+
+func probeWritableMount(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		_ = os.Remove(path)
+		return closeErr
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func isRetriableMountReadyError(err error) bool {
+	return isRetriableMountSyncError(err) || errors.Is(err, os.ErrNotExist)
+}
+
+func remoteDirectoryIsEmpty(ctx context.Context, client *tlsrcpu.Client, remoteRoot string) (bool, error) {
+	debugSeedf("list root %s", remoteRoot)
+	exp := exportfs.New(client, remoteRoot)
+	entries, err := exp.List(ctx, "/")
+	if err != nil {
+		debugSeedf("list root error: %v", err)
+		return false, err
+	}
+	debugSeedf("list root ok entries=%d", len(entries))
+	return len(entries) == 0, nil
+}
+
+func copyTreeToRemote(ctx context.Context, src string, client *tlsrcpu.Client, remoteRoot string, opts syncdir.Options) error {
+	seen := map[string]struct{}{}
+	err := filepath.WalkDir(src, func(localPath string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, localPath)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if shouldSkipSeedPath(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		seen[rel] = struct{}{}
+		remotePath := path.Join("/", rel)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case info.Mode().IsDir():
+			debugSeedf("mkdir %s", remotePath)
+			exp := exportfs.New(client, remoteRoot)
+			if err := exp.Mkdir(ctx, remotePath, info.Mode().Perm()); err != nil && !errors.Is(err, os.ErrExist) {
+				debugSeedf("mkdir error %s: %v", remotePath, err)
+				return err
+			}
+			return nil
+		case info.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("symlink seeding is not supported for %s", localPath)
+		case info.Mode().IsRegular():
+			debugSeedf("copy file %s -> %s", localPath, remotePath)
+			return copyFileToRemote(ctx, localPath, remotePath, client, remoteRoot, info.Mode().Perm())
+		default:
+			return nil
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if !opts.Mirror {
+		return nil
+	}
+	remotePaths, err := listRemotePaths(ctx, client, remoteRoot, "/")
+	if err != nil {
+		return err
+	}
+	sort.Slice(remotePaths, func(i, j int) bool {
+		return strings.Count(remotePaths[i], "/") > strings.Count(remotePaths[j], "/")
+	})
+	for _, remotePath := range remotePaths {
+		rel := strings.TrimPrefix(remotePath, "/")
+		if _, ok := seen[rel]; ok {
+			continue
+		}
+		debugSeedf("remove extra %s", remotePath)
+		exp := exportfs.New(client, remoteRoot)
+		if err := exp.Remove(ctx, remotePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			debugSeedf("remove extra error %s: %v", remotePath, err)
+			return err
+		}
+	}
+	return nil
+}
+
+func copyFileToRemote(ctx context.Context, localPath, remotePath string, client *tlsrcpu.Client, remoteRoot string, mode fs.FileMode) error {
+	in, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	exp := exportfs.New(client, remoteRoot)
+	debugSeedf("remove before create %s", remotePath)
+	if err := exp.Remove(ctx, remotePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		debugSeedf("remove before create error %s: %v", remotePath, err)
+		return err
+	}
+	debugSeedf("create %s", remotePath)
+	handle, _, err := exp.Create(ctx, remotePath, mode, uint32(os.O_WRONLY|os.O_TRUNC))
+	if err != nil {
+		debugSeedf("create error %s: %v", remotePath, err)
+		return err
+	}
+	defer handle.Close()
+
+	buf := make([]byte, 128*1024)
+	var off int64
+	for {
+		n, readErr := in.Read(buf)
+		if n > 0 {
+			written, writeErr := handle.WriteAt(buf[:n], off)
+			if writeErr != nil {
+				debugSeedf("write error %s at %d: %v", remotePath, off, writeErr)
+				return writeErr
+			}
+			off += int64(written)
+			if written != n {
+				return io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	return nil
+}
+
+func listRemotePaths(ctx context.Context, client *tlsrcpu.Client, remoteRoot, root string) ([]string, error) {
+	exp := exportfs.New(client, remoteRoot)
+	entries, err := exp.List(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		paths = append(paths, entry.Path)
+		if entry.Mode&os.ModeDir != 0 {
+			childPaths, err := listRemotePaths(ctx, client, remoteRoot, entry.Path)
+			if err != nil {
+				return nil, err
+			}
+			paths = append(paths, childPaths...)
+		}
+	}
+	return paths, nil
+}
+
+func shouldSkipSeedPath(rel string) bool {
+	return rel == ".git" || strings.HasPrefix(rel, ".git"+string(filepath.Separator))
+}
+
+func debugSeedf(format string, args ...any) {
+	if os.Getenv("AGENTIC9_DEBUG_SEED") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "seed: "+format+"\n", args...)
+}
+
 func isRetriableMountSyncError(err error) bool {
 	return errors.Is(err, syscall.EIO) ||
 		errors.Is(err, syscall.ENOTCONN) ||
@@ -930,6 +1317,253 @@ func loadProfile(name string) (*config.Config, config.Profile, config.Secret, er
 		return nil, config.Profile{}, config.Secret{}, err
 	}
 	return cfg, profile, secret, nil
+}
+
+func resolveAliasedPathFlag(primaryName, primaryValue, aliasName, aliasValue string) (string, error) {
+	switch {
+	case primaryValue == "":
+		return aliasValue, nil
+	case aliasValue == "":
+		return primaryValue, nil
+	case primaryValue == aliasValue:
+		return primaryValue, nil
+	default:
+		return "", fmt.Errorf("%s and %s must match when both are set", primaryName, aliasName)
+	}
+}
+
+func loadWorkspaceMetadata(runtimeRoot string, manager *workspace.Manager, profile config.Profile, profileName, agentID string) (workspace.Metadata, error) {
+	meta, err := manager.Load(profileName, agentID)
+	if err == nil {
+		return meta, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return workspace.Metadata{}, err
+	}
+	state, ok, err := findMountedRuntimeStateByAgent(runtimeRoot, profileName, agentID, "")
+	if err != nil {
+		return workspace.Metadata{}, err
+	}
+	if ok {
+		meta = workspace.Metadata{
+			Profile:    profileName,
+			AgentID:    agentID,
+			RemoteRoot: workspace.RemoteRoot(profile, agentID),
+			Mountpoint: state.Mountpoint,
+			Mounted:    true,
+			MountPID:   state.PID,
+			CreatedAt:  state.UpdatedAt,
+		}
+		if meta.CreatedAt.IsZero() {
+			meta.CreatedAt = time.Now().UTC()
+		}
+		if err := manager.Save(meta); err != nil {
+			return workspace.Metadata{}, err
+		}
+		return meta, nil
+	}
+	return workspace.Metadata{}, os.ErrNotExist
+}
+
+type runtimeStateSelector func(fusefs.MountState) bool
+
+func findMountedRuntimeStateByAgent(runtimeRoot, profileName, agentID, hintMountpoint string) (fusefs.MountState, bool, error) {
+	return findRuntimeStateByAgent(runtimeRoot, profileName, agentID, hintMountpoint, func(state fusefs.MountState) bool {
+		return state.Status == fusefs.MountStatusMounted && fusefs.ProcessExists(state.PID)
+	})
+}
+
+func findAnyRuntimeStateByAgent(runtimeRoot, profileName, agentID, hintMountpoint string) (fusefs.MountState, bool, error) {
+	return findRuntimeStateByAgent(runtimeRoot, profileName, agentID, hintMountpoint, func(state fusefs.MountState) bool {
+		return true
+	})
+}
+
+func findRuntimeStateByAgent(runtimeRoot, profileName, agentID, hintMountpoint string, selectState runtimeStateSelector) (fusefs.MountState, bool, error) {
+	runtime := fusefs.NewRuntime(runtimeRoot)
+	if hintMountpoint != "" {
+		state, err := runtime.Load(hintMountpoint)
+		switch {
+		case err == nil:
+			if state.Profile == profileName && state.AgentID == agentID && selectState(state) {
+				return state, true, nil
+			}
+		case !errors.Is(err, os.ErrNotExist):
+			return fusefs.MountState{}, false, err
+		}
+	}
+
+	states, err := runtime.List()
+	if err != nil {
+		return fusefs.MountState{}, false, err
+	}
+	var (
+		best    fusefs.MountState
+		found   bool
+		bestAge time.Time
+	)
+	for _, state := range states {
+		if state.Profile != profileName || state.AgentID != agentID || !selectState(state) {
+			continue
+		}
+		if !found || state.UpdatedAt.After(bestAge) {
+			best = state
+			bestAge = state.UpdatedAt
+			found = true
+		}
+	}
+	return best, found, nil
+}
+
+type versionReport struct {
+	CLIVersion           string `json:"cli_version"`
+	ExpectedSkillVersion string `json:"expected_skill_version"`
+}
+
+type workspaceStatusMetadata struct {
+	Present    bool   `json:"present"`
+	Path       string `json:"path"`
+	RemoteRoot string `json:"remote_root,omitempty"`
+	Mountpoint string `json:"mountpoint,omitempty"`
+	Mounted    bool   `json:"mounted"`
+	PID        int    `json:"pid,omitempty"`
+}
+
+type workspaceStatusRuntime struct {
+	Present      bool               `json:"present"`
+	StatePath    string             `json:"state_path,omitempty"`
+	LogPath      string             `json:"log_path,omitempty"`
+	Mountpoint   string             `json:"mountpoint,omitempty"`
+	Status       fusefs.MountStatus `json:"status,omitempty"`
+	PID          int                `json:"pid,omitempty"`
+	ProcessAlive bool               `json:"process_alive"`
+	UpdatedAt    time.Time          `json:"updated_at,omitempty"`
+}
+
+type workspaceStatusRemote struct {
+	Checked bool   `json:"checked"`
+	Exists  bool   `json:"exists"`
+	Root    string `json:"root"`
+	Error   string `json:"error,omitempty"`
+}
+
+type workspaceStatusReport struct {
+	OK                bool                    `json:"ok"`
+	AgentID           string                  `json:"agent_id"`
+	Profile           string                  `json:"profile"`
+	ProjectRoot       string                  `json:"project_root"`
+	RemoteProjectRoot string                  `json:"remote_project_root"`
+	Mounted           bool                    `json:"mounted"`
+	Inconsistencies   []string                `json:"inconsistencies,omitempty"`
+	Version           versionReport           `json:"version"`
+	Metadata          workspaceStatusMetadata `json:"metadata"`
+	Runtime           workspaceStatusRuntime  `json:"runtime"`
+	Remote            workspaceStatusRemote   `json:"remote"`
+}
+
+func inspectWorkspaceState(runtimeRoot string, manager *workspace.Manager, profile config.Profile, profileName, agentID string) (workspaceStatusReport, error) {
+	report := workspaceStatusReport{
+		OK:      true,
+		AgentID: agentID,
+		Profile: profileName,
+		Metadata: workspaceStatusMetadata{
+			Path: manager.Path(profileName, agentID),
+		},
+		Remote: workspaceStatusRemote{
+			Root: workspace.RemoteRoot(profile, agentID),
+		},
+	}
+
+	meta, err := manager.Load(profileName, agentID)
+	switch {
+	case err == nil:
+		report.Metadata.Present = true
+		report.Metadata.RemoteRoot = meta.RemoteRoot
+		report.Metadata.Mountpoint = meta.Mountpoint
+		report.Metadata.Mounted = meta.Mounted
+		report.Metadata.PID = meta.MountPID
+		if meta.RemoteRoot != "" {
+			report.Remote.Root = meta.RemoteRoot
+		}
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return report, err
+	}
+
+	runtime := fusefs.NewRuntime(runtimeRoot)
+	state, runtimePresent, err := findAnyRuntimeStateByAgent(runtimeRoot, profileName, agentID, report.Metadata.Mountpoint)
+	if err != nil {
+		return report, err
+	}
+	if runtimePresent {
+		report.Runtime.Present = true
+		report.Runtime.StatePath = runtime.StatePath(state.Mountpoint)
+		report.Runtime.LogPath = runtime.LogPath(state.Mountpoint)
+		report.Runtime.Mountpoint = state.Mountpoint
+		report.Runtime.Status = state.Status
+		report.Runtime.PID = state.PID
+		report.Runtime.ProcessAlive = fusefs.ProcessExists(state.PID)
+		report.Runtime.UpdatedAt = state.UpdatedAt
+	}
+
+	report.Mounted = runtimePresent && state.Status == fusefs.MountStatusMounted && report.Runtime.ProcessAlive
+	switch {
+	case report.Mounted:
+		report.ProjectRoot = state.Mountpoint
+	case report.Metadata.Mountpoint != "":
+		report.ProjectRoot = report.Metadata.Mountpoint
+	}
+	report.RemoteProjectRoot = report.Remote.Root
+
+	if !report.Metadata.Present && report.Mounted {
+		report.Inconsistencies = append(report.Inconsistencies, "metadata is missing while an active runtime mount exists")
+	}
+	if report.Metadata.Present && report.Metadata.Mounted && !report.Mounted {
+		report.Inconsistencies = append(report.Inconsistencies, "metadata says the workspace is mounted but runtime state is not active")
+	}
+	if report.Metadata.Present && report.Mounted {
+		if report.Metadata.Mountpoint != "" && report.Metadata.Mountpoint != state.Mountpoint {
+			report.Inconsistencies = append(report.Inconsistencies, "metadata mountpoint does not match the active runtime mountpoint")
+		}
+		if report.Metadata.PID != 0 && report.Metadata.PID != state.PID {
+			report.Inconsistencies = append(report.Inconsistencies, "metadata mount pid does not match the active runtime pid")
+		}
+	}
+	return report, nil
+}
+
+func remoteWorkspaceExists(ctx context.Context, profile config.Profile, secret config.Secret, remoteRoot string) (bool, error) {
+	fs := exportfs.New(tlsrcpu.NewClient(profile, secret), remoteRoot)
+	_, err := fs.Stat(ctx, "/")
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func versionInfo() versionReport {
+	return versionReport{
+		CLIVersion:           buildinfo.CLIVersion,
+		ExpectedSkillVersion: buildinfo.SkillVersion,
+	}
+}
+
+func emptyDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func directoryIsEmpty(path string) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) == 0, nil
 }
 
 func writeJSON(v any) error {

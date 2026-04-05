@@ -33,7 +33,7 @@ Already validated:
 - there are opt-in real-host integration tests for:
   - `Verify` + simple `Exec`
   - exportfs create/read/stat/rename/list round-trip
-  - `workspace create` -> mounted file access -> `workspace path` -> `workspace delete` when `AGENTIC9_IT_WORKSPACE=1`
+  - `workspace create` -> mounted `project_root` file access -> `workspace path` -> `workspace delete` when `AGENTIC9_IT_WORKSPACE=1`
 
 Still not broadly validated:
 
@@ -97,7 +97,7 @@ What it does not prove:
 
 ### Level 3: Manual foreground mount testing
 
-Run `agentic9 mount` in one terminal without `--json`, then use the mount from another terminal.
+Run `agentic9 mount` in one terminal without `--json`, then use the mounted `project_root` from another terminal.
 
 What this proves:
 
@@ -365,7 +365,7 @@ Before handing tasks off, these are the most useful manual checks to run against
 
 1. `agentic9 profile verify --profile <name> --json`
 2. `agentic9 exec --profile <name> --agent-id test --json -- echo ok`
-3. Foreground `agentic9 mount --profile <name> --agent-id test --mountpoint /tmp/a9mnt`
+3. Foreground `agentic9 mount --profile <name> --agent-id test --project-root /tmp/a9mnt`
 4. From another shell: `ls`, `cat`, `touch`, `mv`, `rm` under `/tmp/a9mnt`
 5. Confirm whether symlink operations work or fail
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"syscall"
 	"time"
 )
@@ -63,6 +64,35 @@ func (r *Runtime) Load(mountpoint string) (MountState, error) {
 	return state, nil
 }
 
+func (r *Runtime) List() ([]MountState, error) {
+	entries, err := os.ReadDir(r.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	states := make([]MountState, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(r.root, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		var state MountState
+		if err := json.Unmarshal(data, &state); err != nil {
+			return nil, err
+		}
+		states = append(states, state)
+	}
+	sort.Slice(states, func(i, j int) bool {
+		return states[i].Mountpoint < states[j].Mountpoint
+	})
+	return states, nil
+}
+
 func (r *Runtime) Delete(mountpoint string) error {
 	err := os.Remove(r.statePath(mountpoint))
 	if errors.Is(err, os.ErrNotExist) {
@@ -73,6 +103,10 @@ func (r *Runtime) Delete(mountpoint string) error {
 
 func (r *Runtime) LogPath(mountpoint string) string {
 	return filepath.Join(r.root, stateKey(mountpoint)+".log")
+}
+
+func (r *Runtime) StatePath(mountpoint string) string {
+	return r.statePath(mountpoint)
 }
 
 func (r *Runtime) ClearStale(mountpoint string) error {

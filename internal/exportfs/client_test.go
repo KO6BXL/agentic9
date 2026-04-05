@@ -264,11 +264,92 @@ func TestMkdirUsesDirectoryPermBit(t *testing.T) {
 			},
 			reply: ninep.Fcall{Type: ninep.RCREATE, QID: ninep.QID{Type: 0x80, Path: 2}},
 		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TCLUNK || req.FID != 2 {
+					t.Fatalf("unexpected clunk request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RCLUNK},
+		},
 	}}
 	client := New(fakeOpener{stream: stream}, "/remote")
 
 	if err := client.Mkdir(context.Background(), "/child", 0o755); err != nil {
 		t.Fatalf("Mkdir: %v", err)
+	}
+	if len(stream.expectations) != 0 {
+		t.Fatalf("unconsumed expectations: %d", len(stream.expectations))
+	}
+}
+
+func TestRemoteFileWriteAtChunksLargeWrites(t *testing.T) {
+	large := bytes.Repeat([]byte("x"), maxIOChunk+17)
+	stream := &fakeStream{t: t, expectations: []expectation{
+		{reply: ninep.Fcall{Type: ninep.RVERSION, Msize: 8192, Version: "9P2000"}},
+		{reply: ninep.Fcall{Type: ninep.RATTACH, QID: ninep.QID{Type: 0x80, Path: 1}}},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TWALK || req.FID != 1 || req.NewFID != 2 || len(req.WNames) != 0 {
+					t.Fatalf("unexpected walk request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RWALK, WQIDs: nil},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TSTAT || req.FID != 2 {
+					t.Fatalf("unexpected stat request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RSTAT, Dir: &ninep.Dir{Name: "/", UID: "glenda", GID: "glenda", MUID: "glenda", Mode: 0x80000000 | 0o755}},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TCREATE || req.FID != 2 || req.Name != "large.bin" {
+					t.Fatalf("unexpected create request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RCREATE, QID: ninep.QID{Path: 2}},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TWRITE || req.FID != 2 || len(req.Data) != maxIOChunk || req.Offset != 0 {
+					t.Fatalf("unexpected first write request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RWRITE, Count: maxIOChunk},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TWRITE || req.FID != 2 || len(req.Data) != 17 || req.Offset != uint64(maxIOChunk) {
+					t.Fatalf("unexpected second write request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RWRITE, Count: 17},
+		},
+		{
+			check: func(req ninep.Fcall) {
+				if req.Type != ninep.TCLUNK || req.FID != 2 {
+					t.Fatalf("unexpected clunk request: %#v", req)
+				}
+			},
+			reply: ninep.Fcall{Type: ninep.RCLUNK},
+		},
+	}}
+	client := New(fakeOpener{stream: stream}, "/remote")
+
+	handle, _, err := client.Create(context.Background(), "/large.bin", 0o644, uint32(os.O_WRONLY|os.O_TRUNC))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if n, err := handle.WriteAt(large, 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	} else if n != len(large) {
+		t.Fatalf("WriteAt bytes = %d, want %d", n, len(large))
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 	if len(stream.expectations) != 0 {
 		t.Fatalf("unconsumed expectations: %d", len(stream.expectations))
