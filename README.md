@@ -16,5 +16,6 @@ If you are not inside the `agentic9` source tree, use the installed `agentic9` b
 
 ## More details
 
-- CLI usage details and automation guidance: [SKILL.md](/home/me1on/proj/agentic9/SKILL.md)
-- current implementation backlog: [TODO.md](/home/me1on/proj/agentic9/TODO.md)
+- CLI usage details and automation guidance: [SKILL.md](./SKILL.md)
+- current implementation backlog: [TODO.md](./TODO.md)
+- **CONFIGURATION!** [here](./CONFIG.md)
